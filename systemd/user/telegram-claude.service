@@ -21,7 +21,7 @@ KillMode=mixed
 
 # Environment needed for Claude CLI
 Environment=HOME=%h
-Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/bin:%h/.bun/bin:%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # [M-20 + L-30] UTF-8 locale so tmux/claude render status bar glyphs (█▌░❯)
 # the watchdog relies on. A non-UTF-8 locale would silently break detection.
 Environment=LANG=en_US.UTF-8

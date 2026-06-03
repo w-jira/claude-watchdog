@@ -5,18 +5,153 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="${HOME}/.claude/channels/telegram"
 WORKDIR="${STATE_DIR}/workdir"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
+BUN_VERSION="${BUN_VERSION:-bun-v1.3.14}"
+INSTALL_DEPS=0
+START_SERVICE=0
+YES=0
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "missing required command: $1" >&2
-    exit 1
-  }
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [options]
+
+One-stop installer for claude-watchdog.
+
+Options:
+  --install-deps              Install missing OS/user deps where supported.
+  --token TOKEN               Write Telegram bot token to ~/.claude/channels/telegram/.env.
+  --telegram-user-id ID       Allow this Telegram user ID in access.json.
+  --start                     Start the systemd user service after install.
+  -y, --yes                   Non-interactive yes for supported install steps.
+  -h, --help                  Show this help.
+
+Agent-friendly example:
+  TELEGRAM_BOT_TOKEN='123:abc' TELEGRAM_USER_ID='123456789' \
+    ./install.sh --install-deps --start --yes
+
+Notes:
+  - Claude Code CLI must be installed and authenticated before the bot can run.
+  - If bun is missing and --install-deps is set, this installs a pinned Bun release
+    into ~/.bun/bin and symlinks it into ~/bin.
+EOF
 }
 
-need claude
-need tmux
-need systemctl
-need python3
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --install-deps) INSTALL_DEPS=1 ;;
+    --start) START_SERVICE=1 ;;
+    -y|--yes) YES=1 ;;
+    --token) shift; BOT_TOKEN="${1:-}" ;;
+    --telegram-user-id) shift; TELEGRAM_USER_ID="${1:-}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+ done
+
+log() { printf '[claude-watchdog] %s\n' "$*"; }
+warn() { printf '[claude-watchdog] warning: %s\n' "$*" >&2; }
+die() { printf '[claude-watchdog] error: %s\n' "$*" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  local prompt="$1"
+  [ "$YES" = "1" ] && return 0
+  printf '%s [y/N] ' "$prompt"
+  read -r ans
+  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+install_apt_deps() {
+  local missing=()
+  for cmd in tmux python3 curl unzip git; do
+    has "$cmd" || missing+=("$cmd")
+  done
+  [ "${#missing[@]}" -gt 0 ] || return 0
+  has apt-get || die "missing commands (${missing[*]}) and this installer only auto-installs OS deps with apt-get"
+  confirm "Install OS packages with sudo apt-get: ${missing[*]}?" || die "dependency install declined"
+  sudo apt-get update
+  sudo apt-get install -y tmux python3 curl unzip git ca-certificates
+}
+
+install_bun() {
+  if has bun; then
+    return 0
+  fi
+  [ "$INSTALL_DEPS" = "1" ] || return 0
+  has curl || die "curl is required to install bun"
+  has unzip || die "unzip is required to install bun"
+
+  local arch asset tmp zipdir
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *) die "unsupported architecture for bundled bun install: $(uname -m)" ;;
+  esac
+  asset="bun-linux-${arch}.zip"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  log "installing ${BUN_VERSION} to ~/.bun/bin"
+  curl -fL --proto '=https' --tlsv1.2 \
+    "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/${asset}" \
+    -o "${tmp}/${asset}"
+  unzip -q "${tmp}/${asset}" -d "$tmp"
+  zipdir="${tmp}/bun-linux-${arch}"
+  install -d -m 700 "${HOME}/.bun/bin" "${HOME}/bin"
+  install -m 700 "${zipdir}/bun" "${HOME}/.bun/bin/bun"
+  ln -sfn "${HOME}/.bun/bin/bun" "${HOME}/bin/bun"
+}
+
+write_env() {
+  if [ -n "$BOT_TOKEN" ]; then
+    case "$BOT_TOKEN" in
+      *:*) ;;
+      *) die "Telegram bot token should look like '<bot-id>:<secret>'" ;;
+    esac
+    umask 077
+    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN" > "${STATE_DIR}/.env"
+    chmod 600 "${STATE_DIR}/.env"
+    log "wrote ${STATE_DIR}/.env"
+  elif [ ! -f "${STATE_DIR}/.env" ]; then
+    install -m 600 "${ROOT}/config/env.example" "${STATE_DIR}/.env"
+    warn "created ${STATE_DIR}/.env — edit TELEGRAM_BOT_TOKEN before starting"
+  fi
+}
+
+write_access() {
+  if [ -n "$TELEGRAM_USER_ID" ]; then
+    [[ "$TELEGRAM_USER_ID" =~ ^[0-9]+$ ]] || die "Telegram user ID must be numeric"
+    python3 - "$TELEGRAM_USER_ID" "${STATE_DIR}/access.json" <<'PY'
+import json, sys
+user_id, path = sys.argv[1], sys.argv[2]
+payload = {
+    "dmPolicy": "allowlist",
+    "allowFrom": [user_id],
+    "groups": {},
+    "pending": {},
+    "ackReaction": "👀",
+    "replyToMode": "first",
+    "textChunkLimit": 4096,
+    "chunkMode": "newline",
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    chmod 600 "${STATE_DIR}/access.json"
+    log "wrote ${STATE_DIR}/access.json"
+  elif [ ! -f "${STATE_DIR}/access.json" ]; then
+    install -m 600 "${ROOT}/config/access.example.json" "${STATE_DIR}/access.json"
+    warn "created ${STATE_DIR}/access.json — add your Telegram user ID before starting"
+  fi
+}
+
+if [ "$INSTALL_DEPS" = "1" ]; then
+  install_apt_deps
+  install_bun
+fi
 
 mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
@@ -29,20 +164,28 @@ install -m 700 "${ROOT}/bin/claude-tele-control-mcp.py" "${HOME}/bin/claude-tele
 install -m 600 "${ROOT}/systemd/user/telegram-claude.service" "${SYSTEMD_DIR}/telegram-claude.service"
 install -m 600 "${ROOT}/systemd/user/telegram-claude-watchdog.service" "${SYSTEMD_DIR}/telegram-claude-watchdog.service"
 
-if [ ! -f "${STATE_DIR}/.env" ]; then
-  install -m 600 "${ROOT}/config/env.example" "${STATE_DIR}/.env"
-  echo "created ${STATE_DIR}/.env — edit TELEGRAM_BOT_TOKEN before starting"
-fi
-
-if [ ! -f "${STATE_DIR}/access.json" ]; then
-  install -m 600 "${ROOT}/config/access.example.json" "${STATE_DIR}/access.json"
-  echo "created ${STATE_DIR}/access.json — add your Telegram user ID before starting"
-fi
+write_env
+write_access
 
 systemctl --user daemon-reload
+loginctl enable-linger "${USER}" >/dev/null 2>&1 || warn "could not enable linger; service may stop after logout"
 
-echo "installed. Next:"
-echo "  1. edit ${STATE_DIR}/.env"
-echo "  2. edit ${STATE_DIR}/access.json"
-echo "  3. claude-tele doctor"
-echo "  4. claude-tele start"
+missing=()
+for cmd in claude tmux python3 systemctl bun; do
+  has "$cmd" || missing+=("$cmd")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  warn "missing commands: ${missing[*]}"
+  warn "run again with --install-deps for supported deps; install/authenticate Claude Code separately"
+fi
+
+if [ "$START_SERVICE" = "1" ]; then
+  has claude || die "claude CLI is missing; install and authenticate it before --start"
+  [ -s "${STATE_DIR}/.env" ] || die "missing ${STATE_DIR}/.env"
+  [ -s "${STATE_DIR}/access.json" ] || die "missing ${STATE_DIR}/access.json"
+  "${HOME}/bin/claude-tele" start
+fi
+
+log "installed"
+log "next: claude-tele doctor"
+[ "$START_SERVICE" = "1" ] || log "then: claude-tele start"

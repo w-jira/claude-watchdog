@@ -1,12 +1,14 @@
-# claude-tele
+# claude-watchdog
 
-Always-on Claude Code Telegram channel lifecycle tooling.
+One-stop installer and watchdog for running Claude Code as an always-on Telegram bot.
 
-`claude-tele` runs a single managed Claude Code Telegram session under user-systemd, watches for common failure modes, auto-compacts when context is high, and can replay journaled Telegram messages missed during restarts.
+`claude-watchdog` installs a user-systemd managed Claude Code Telegram session, keeps it alive, auto-compacts high-context sessions, and recovers common Telegram bridge failures.
 
 ## What it does
 
 - Runs one Claude Code Telegram channel in `tmux` + `systemd --user`.
+- Installs service files and helper scripts into the current user account.
+- Optionally installs supported dependencies like `tmux`, `curl`, `unzip`, `git`, and a pinned Bun release.
 - Keeps Telegram transcripts isolated in `~/.claude/channels/telegram/workdir`.
 - Prevents/reports missing Telegram plugin bridge (`bun`) failures.
 - Auto-compacts when context usage is high and Claude appears idle.
@@ -16,23 +18,66 @@ Always-on Claude Code Telegram channel lifecycle tooling.
 
 ## Requirements
 
+Required before the bot can run:
+
 - Linux with `systemd --user`
-- `claude` CLI installed and authenticated
-- `tmux`
-- Python 3.11+
+- Claude Code CLI installed and authenticated
 - Telegram bot token from BotFather
-- Claude Telegram channel plugin: `plugin:telegram@claude-plugins-official`
+- Your numeric Telegram user ID for the allowlist
+
+The installer can handle these on Debian/Ubuntu when run with `--install-deps`:
+
+- `tmux`
+- `python3`
+- `curl`
+- `unzip`
+- `git`
+- `bun` pinned to `bun-v1.3.14` by default
 
 Optional:
 
 - `msmtp` for watchdog circuit-breaker email alerts
 - `mcp` Python package if you want to run `bin/claude-tele-control-mcp.py`
 
-## Quick start
+## Fast path
 
 ```bash
-git clone https://github.com/YOUR_USER/claude-tele.git
-cd claude-tele
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
+TELEGRAM_USER_ID='123456789' \
+  ./install.sh --install-deps --start --yes
+```
+
+Then check:
+
+```bash
+claude-tele status
+claude-tele logs
+```
+
+## Agent-friendly setup
+
+If an AI agent is helping you install this, give it only these values:
+
+- Telegram bot token
+- Telegram user ID
+- whether it may run `sudo apt-get install` for missing OS packages
+
+Recommended agent command:
+
+```bash
+TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
+  ./install.sh --install-deps --start --yes
+```
+
+The installer is idempotent: re-running it updates scripts/services and preserves existing config unless token/user ID are explicitly provided.
+
+## Manual setup
+
+```bash
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
 ./install.sh
 ```
 
@@ -72,6 +117,20 @@ claude-tele start
 claude-tele status
 ```
 
+## Installer options
+
+```bash
+./install.sh --help
+```
+
+Options:
+
+- `--install-deps`: install missing supported dependencies.
+- `--token TOKEN`: write Telegram bot token.
+- `--telegram-user-id ID`: write allowlist config.
+- `--start`: start the bot after install.
+- `--yes`: non-interactive yes for supported install steps.
+
 ## Commands
 
 ```bash
@@ -89,18 +148,18 @@ claude-tele doctor
 
 ## No GitHub login on the VM
 
-If this repo is public, the VM does not need GitHub authentication:
+Public HTTPS clone needs no GitHub login:
 
 ```bash
-git clone https://github.com/YOUR_USER/claude-tele.git
+git clone https://github.com/w-jira/claude-watchdog.git
 ```
 
 Or avoid GitHub entirely by copying a tarball over SSH:
 
 ```bash
-tar -czf claude-tele.tar.gz claude-tele
-scp claude-tele.tar.gz user@your-vm:~/
-ssh user@your-vm 'tar -xzf claude-tele.tar.gz && cd claude-tele && ./install.sh'
+tar -czf claude-watchdog.tar.gz claude-watchdog
+scp claude-watchdog.tar.gz user@your-vm:~/
+ssh user@your-vm 'tar -xzf claude-watchdog.tar.gz && cd claude-watchdog && ./install.sh'
 ```
 
 ## Safety rules
