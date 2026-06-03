@@ -1,58 +1,8 @@
 # claude-watchdog
 
-One-stop installer and watchdog for running Claude Code as an always-on Telegram bot.
+Run Claude Code from Telegram without babysitting a terminal.
 
-`claude-watchdog` installs a user-systemd managed Claude Code Telegram session, keeps it alive, auto-compacts high-context sessions, and recovers common Telegram bridge failures.
-
-## What it does
-
-- Runs one Claude Code Telegram channel in `tmux` + `systemd --user`.
-- Installs service files and helper scripts into the current user account.
-- Optionally installs supported dependencies like `tmux`, `curl`, `unzip`, `git`, and a pinned Bun release.
-- Keeps Telegram transcripts isolated in `~/.claude/channels/telegram/workdir`.
-- Prevents/reports missing Telegram plugin bridge (`bun`) failures.
-- Auto-compacts when context usage is high and Claude appears idle.
-- Journals allowed inbound Telegram messages before MCP delivery.
-- Replays journaled Telegram texts that are absent from Claude transcripts after restart.
-- Optional least-privilege MCP helper can request only `/compact`.
-
-## Platform support
-
-- **Linux:** full support via `systemd --user` + `tmux` + watchdog auto-heal/auto-compact.
-- **macOS:** beta support via LaunchAgent + `tmux`. Runs the Telegram bot at login and supports `start`, `stop`, `restart`, `status`, `attach`, `logs`, `heal`, and `doctor`. Auto-compact watchdog parity is not implemented yet.
-- **Windows:** beta native support via PowerShell + Scheduled Task. Runs/restarts Claude at logon and supports `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. First-run Claude trust/permissions prompts may need to be accepted once interactively. Native Windows beta intentionally does not use `--continue` yet to avoid resuming an unrelated interactive Windows transcript; WSL2 remains the recommended Windows path for Linux-equivalent behavior, including full watchdog/tmux parity.
-
-## Requirements
-
-Required before the bot can run:
-
-- Claude Code CLI installed and authenticated
-- Telegram bot token from BotFather
-- Your numeric Telegram user ID for the allowlist
-
-Linux full mode also requires:
-
-- Linux with `systemd --user`
-
-The Linux installer can handle these on Debian/Ubuntu when run with `--install-deps`:
-
-- `tmux`
-- `python3`
-- `curl`
-- `unzip`
-- `git`
-- `bun` pinned to `bun-v1.3.14` by default
-
-Optional:
-
-- `msmtp` for watchdog circuit-breaker email alerts
-- `mcp` Python package if you want to run `bin/claude-tele-control-mcp.py`
-
-## Fast path
-
-### Linux
-
-Interactive setup app (recommended because the bot token is hidden and never passed as a command-line argument):
+`claude-watchdog` sets up one always-on Claude Code session, connected through Anthropic's official Telegram plugin. It installs the service, keeps the bot alive, protects the setup flow from common token leaks, and gives you a small CLI for day-to-day operations.
 
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
@@ -60,81 +10,135 @@ cd claude-watchdog
 ./bin/cwd setup
 ```
 
-Agent/non-interactive:
+After install:
 
 ```bash
-TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
-TELEGRAM_USER_ID='123456789' \
-  ./install.sh --install-deps --permission-mode default --demo --start --yes
+cwd status
+cwd logs
+cwd restart
 ```
 
-### macOS
+## Why this exists
+
+Claude Code already has a Telegram plugin. The hard part is running it safely for more than five minutes.
+
+This repo handles the boring production bits:
+
+- one Telegram poller per bot token
+- automatic restart after crashes
+- isolated workdir so Telegram does not hijack your normal Claude session
+- secure setup wizard for bot token and allowlist config
+- demo mode that hides logs and local runtime details while you present
+- Linux watchdog support for health checks, missed-message replay, and context compaction
+
+## Recommended setup
+
+Use the CLI wizard. It keeps the bot token out of shell history and command arguments.
 
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
-TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
-TELEGRAM_USER_ID='123456789' \
-  ./install-macos.sh --install-deps --permission-mode default --demo --start --yes
+./bin/cwd setup
 ```
 
-### Windows PowerShell
+The wizard asks for:
 
-```powershell
-git clone https://github.com/w-jira/claude-watchdog.git
-cd claude-watchdog
-$env:TELEGRAM_BOT_TOKEN = "replace-with-botfather-token"
-$env:TELEGRAM_USER_ID = "123456789"
-.\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
-```
+- Telegram bot token from BotFather
+- your Telegram user ID, which it can auto-detect by asking you to send a one-time test message to the bot
+- Claude permission mode
+- demo mode on/off
+- whether to install missing dependencies
+- whether to start the bot immediately
 
-On Windows, if Claude exits or hangs on a first-run trust/permissions prompt, run this once in an interactive terminal from `%USERPROFILE%\.claude\channels\telegram\workdir`, accept the prompts, then restart the task:
+By default, `cwd setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
 
-```powershell
-claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" restart
-```
-
-Then check:
-
-Linux/macOS:
+## Daily commands
 
 ```bash
-claude-tele status
-claude-tele logs
+cwd help       # friendly command menu
+cwd setup      # guided setup or reconfiguration
+cwd status     # service + bot status
+cwd start      # start the bot
+cwd stop       # stop the bot
+cwd restart    # restart the bot
+cwd doctor     # diagnostics
+cwd logs       # logs; blocked in demo mode unless raw is requested
 ```
 
-Windows:
+Linux still exposes the lower-level power-user CLI:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" status
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" logs
+```bash
+claude-tele compact --json
+claude-tele replay-missed --dry-run
+claude-tele attach
 ```
 
-## Agent-friendly setup
+## Platform support
 
-If an AI agent is helping you install this, give it only these values:
+- Linux: full support. Uses `systemd --user`, `tmux`, watchdog auto-heal, context compaction, and missed-message replay.
+- macOS: beta. Uses LaunchAgent and `tmux`. Supports setup, start/stop/restart, status, logs, attach, heal, and doctor. The full Linux watchdog is not implemented yet.
+- Windows native: beta. Uses PowerShell and a per-user Scheduled Task. Good for basic always-on operation. WSL2 is still the better Windows path if you want Linux-equivalent behavior.
 
-- Target OS: Linux, macOS, Windows native, or Windows WSL2
-- Telegram bot token
-- Telegram user ID
-- whether it may install missing dependencies (`sudo apt-get` on Debian/Ubuntu, Homebrew on macOS, winget on Windows)
+## Requirements
 
-Recommended Linux agent command:
+Before the bot can run, you need:
+
+- Claude Code CLI installed and authenticated
+- a Telegram bot token from BotFather
+- your Telegram user ID; `cwd setup` can detect it automatically from a one-time test message
+
+Linux full mode also needs `systemd --user`. On Debian/Ubuntu, `cwd setup` can install supported dependencies when you approve it.
+
+## Permissions
+
+The setup wizard lets you choose how much autonomy Claude gets:
+
+- `default`: safest default; Claude asks before tools
+- `plan`: read and plan first
+- `acceptEdits`: accept file edits automatically
+- `auto`: let Claude decide when to ask
+- `dontAsk`: fewer prompts
+- `bypassPermissions`: no permission prompts; only use in a sandbox
+
+For demos and shared machines, start with `default` plus demo mode.
+
+## Demo mode
+
+Demo mode reduces accidental disclosure while presenting.
+
+It hides PIDs, local paths, and detailed runtime status. It also blocks logs unless you explicitly request raw output.
+
+Demo mode does not erase old transcripts or logs. If you already ran the bot with sensitive prompts, clean those separately before recording or presenting.
+
+## Agentic setup
+
+If another AI agent is installing this for you, do not paste secrets into a chat transcript unless you trust that environment.
+
+Use the dedicated agent setup guide instead:
+
+- [docs/AGENT_SETUP.md](docs/AGENT_SETUP.md)
+
+That file contains the non-interactive commands and the security caveats. The main path for humans is still `./bin/cwd setup`.
+
+## Manual install commands
+
+Use these only when you need non-interactive setup or are building automation around the repo.
+
+Linux:
 
 ```bash
 TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
   ./install.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
-Recommended macOS agent command:
+macOS:
 
 ```bash
 TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
   ./install-macos.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
-Recommended Windows PowerShell agent command:
+Windows PowerShell:
 
 ```powershell
 $env:TELEGRAM_BOT_TOKEN = "<bot-token>"
@@ -142,206 +146,33 @@ $env:TELEGRAM_USER_ID = "<telegram-user-id>"
 .\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
 ```
 
-The installers are idempotent: re-running them updates scripts/services and preserves existing config unless token/user ID are explicitly provided.
+These paths are useful for agents and CI, but they are less safe for humans because tokens can land in shell history or process environments. Prefer `cwd setup` when you are at a terminal.
 
-## Manual setup
+## Security model
 
-Linux:
+`claude-watchdog` is designed to avoid the easy mistakes:
 
-```bash
-git clone https://github.com/w-jira/claude-watchdog.git
-cd claude-watchdog
-./install.sh
-```
+- token input is hidden in the setup wizard
+- token is not passed to child installers as an argument
+- generated config files are private (`0600` on Linux/macOS, restricted ACLs on Windows)
+- `cwd setup` encrypts the bot token at rest when OpenSSL is available
+- `.env` is parsed as data, never sourced or evaluated
+- Telegram access is allowlisted by user ID
+- the Claude session runs from an isolated workdir
 
-macOS:
+This is not a substitute for OS account security. A process running as your user can generally read your files and process environment. Use a dedicated Telegram bot token and rotate it if it may have been exposed.
 
-```bash
-git clone https://github.com/w-jira/claude-watchdog.git
-cd claude-watchdog
-./install-macos.sh
-```
-
-Windows PowerShell:
-
-```powershell
-git clone https://github.com/w-jira/claude-watchdog.git
-cd claude-watchdog
-.\install-windows.ps1
-```
-
-Then edit:
-
-```bash
-nano ~/.claude/channels/telegram/.env
-nano ~/.claude/channels/telegram/access.json
-```
-
-Example `.env`:
-
-```bash
-TELEGRAM_BOT_TOKEN=replace-with-botfather-token
-CLAUDE_PERMISSION_MODE=default
-CLAUDE_WATCHDOG_DEMO=0
-```
-
-Example `access.json`:
-
-```json
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["123456789"],
-  "groups": {},
-  "pending": {},
-  "ackReaction": "👀",
-  "replyToMode": "first",
-  "textChunkLimit": 4096,
-  "chunkMode": "newline"
-}
-```
-
-Start it:
-
-```bash
-claude-tele doctor
-claude-tele start
-claude-tele status
-```
-
-## Installer options
-
-Linux:
-
-```bash
-./install.sh --help
-```
-
-macOS:
-
-```bash
-./install-macos.sh --help
-```
-
-Windows:
-
-```powershell
-Get-Help .\install-windows.ps1
-```
-
-Common options:
-
-- `--install-deps` / `-InstallDeps`: install missing supported dependencies.
-- `--token TOKEN` / `-Token TOKEN`: write Telegram bot token. Prefer `./bin/cwd setup` so the token is hidden and not placed in shell history or process arguments.
-- `--telegram-user-id ID` / `-TelegramUserId ID`: write allowlist config.
-- `--permission-mode MODE` / `-PermissionMode MODE`: choose Claude permissions (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, or `bypassPermissions`). Use `default` for safe demos; use `bypassPermissions` only in sandboxes.
-- `--demo` / `-Demo`: hide sensitive runtime details in status output and block logs unless explicitly requested raw.
-- `--start` / `-Start`: start the bot after install.
-- `--yes` / `-Yes`: non-interactive yes for supported install steps.
-
-Linux/macOS also support `./bin/cwd setup`, a small interactive CLI app for token, Telegram user ID, permission level, demo mode, dependency install, and start/no-start. It reads the bot token with hidden input, writes config files with `0600` permissions, and does not pass the token as a command-line argument.
-
-## Commands
-
-Friendly CLI:
-
-```bash
-cwd setup
-cwd status
-cwd start
-cwd stop
-cwd restart
-cwd doctor
-```
-
-Linux full mode:
-
-```bash
-claude-tele start
-claude-tele stop
-claude-tele restart
-claude-tele status
-claude-tele attach
-claude-tele logs [-f]
-claude-tele heal
-claude-tele compact [--json] [--force]
-claude-tele replay-missed [--dry-run]
-claude-tele doctor
-```
-
-macOS beta mode:
-
-```bash
-claude-tele start
-claude-tele stop
-claude-tele restart
-claude-tele status
-claude-tele attach
-claude-tele logs [-f]
-claude-tele heal
-claude-tele doctor
-```
-
-Windows beta mode:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" start
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" stop
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" restart
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" status
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" logs
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" doctor
-```
-
-## No GitHub login on the VM
-
-Public HTTPS clone needs no GitHub login:
-
-```bash
-git clone https://github.com/w-jira/claude-watchdog.git
-```
-
-Or avoid GitHub entirely by copying a tarball over SSH:
-
-```bash
-tar -czf claude-watchdog.tar.gz claude-watchdog
-scp claude-watchdog.tar.gz user@your-vm:~/
-ssh user@your-vm 'tar -xzf claude-watchdog.tar.gz && cd claude-watchdog && ./install.sh'
-```
-
-## Safety rules
-
-- Never run another `claude --channels plugin:telegram@claude-plugins-official` poller with the same bot token.
-- Do not commit `.env`, `access.json`, transcripts, `inbox/`, PID/lock files, or Claude plugin cache contents.
-- Keep the service `WorkingDirectory` stable unless intentionally starting a new transcript lineage.
-- Use a dedicated Telegram bot token for this service.
-
-## Watchdog tuning
-
-Edit `~/.config/systemd/user/telegram-claude-watchdog.service`, then run:
-
-```bash
-systemctl --user daemon-reload
-claude-tele restart
-```
-
-Useful environment variables:
-
-```ini
-Environment=WATCHDOG_THRESHOLD=40
-Environment=WATCHDOG_INTERVAL=300
-Environment=WATCHDOG_GETME_EVERY=3
-Environment=WATCHDOG_WARMUP=60
-Environment=WATCHDOG_ALERT_EMAIL=you@example.com
-Environment=WATCHDOG_ALERT_FROM=claude-tele-watchdog@example.com
-Environment=WATCHDOG_MSMTP_ACCOUNT=default
-```
-
-Email alerts are disabled unless `WATCHDOG_ALERT_EMAIL` is set.
-
-## Validation
+## Validate changes
 
 ```bash
 ./tests/validate.sh
 ```
 
-This checks shell syntax, Python syntax, user-systemd unit validity, and common secret/personal-infra leaks.
+Validation checks shell syntax, Python syntax, user-systemd unit validity, and common public-release leaks.
+
+## Safety rules
+
+- Run only one poller per Telegram bot token.
+- Do not commit `.env`, `.token.enc`, `.token.key`, `access.json`, transcripts, inbox files, PID files, locks, or plugin cache contents.
+- Keep the Telegram workdir stable unless you intentionally want a new transcript lineage.
+- Use `cwd doctor` before debugging a failed install.

@@ -15,6 +15,7 @@ $OutLog = Join-Path $StateDir "claude-watchdog.out.log"
 $ErrLog = Join-Path $StateDir "claude-watchdog.err.log"
 $TaskName = "ClaudeWatchdogTelegram"
 $EnvFile = Join-Path $StateDir ".env"
+$TokenEncFile = Join-Path $StateDir ".token.enc"
 
 function Log($Message) { Write-Host "[claude-watchdog] $Message" }
 function Warn($Message) { Write-Warning "[claude-watchdog] $Message" }
@@ -27,6 +28,17 @@ function Get-EnvValue($Name, $Default) {
   return ($line.Substring($Name.Length + 1)).Trim('"', "'")
 }
 function Test-DemoMode { (Get-EnvValue "CLAUDE_WATCHDOG_DEMO" "0") -eq "1" }
+function Get-TelegramToken {
+  if ((Get-EnvValue "TELEGRAM_BOT_TOKEN_ENCRYPTED" "0") -eq "1") {
+    if (-not (Test-Path $TokenEncFile)) { Die "encrypted Telegram token missing" }
+    $secure = Get-Content $TokenEncFile | ConvertTo-SecureString
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+  }
+  return Get-EnvValue "TELEGRAM_BOT_TOKEN" ""
+}
+
 function Get-PermissionArgs {
   $mode = Get-EnvValue "CLAUDE_PERMISSION_MODE" "bypassPermissions"
   switch ($mode) {
@@ -68,8 +80,12 @@ function Start-ClaudeLoop {
       # across shells, and a broad --continue can resume the user's unrelated
       # interactive session. WSL2/Linux mode provides full transcript-resume
       # parity today.
+      $token = Get-TelegramToken
+      if (-not $token) { Die "Telegram bot token missing or encrypted token could not be decrypted" }
+      $env:TELEGRAM_BOT_TOKEN = $token
       $args = @() + (Get-PermissionArgs) + @("--channels", "plugin:telegram@claude-plugins-official")
       $proc = Start-Process -FilePath "claude" -ArgumentList $args -NoNewWindow -PassThru -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog
+      Remove-Item Env:TELEGRAM_BOT_TOKEN -ErrorAction SilentlyContinue
       Set-Content -Path $PidFile -Value $proc.Id -Encoding ASCII
       $proc.WaitForExit()
       Log "claude exited with code $($proc.ExitCode); restarting in 30s"
@@ -114,6 +130,7 @@ function Doctor {
   if (-not (HasCommand claude)) { Die "claude CLI missing" } else { Log "claude installed" }
   if (-not (HasCommand bun)) { Die "bun missing" } else { & bun --version *> $null; Log "bun runs" }
   if (-not (Test-Path (Join-Path $StateDir ".env"))) { Die "missing $StateDir\.env" } else { Log ".env present" }
+  if ((Get-EnvValue "TELEGRAM_BOT_TOKEN_ENCRYPTED" "0") -eq "1") { [void](Get-TelegramToken); Log "encrypted token decrypts" }
   if (-not (Test-Path (Join-Path $StateDir "access.json"))) { Die "missing $StateDir\access.json" } else { Log "access.json present" }
   if (-not (Test-PluginInstalled)) { Die "telegram plugin missing" } else { Log "telegram plugin installed" }
   Log "all checks passed"

@@ -5,6 +5,8 @@
 Never commit:
 
 - `~/.claude/channels/telegram/.env`
+- `~/.claude/channels/telegram/.token.enc`
+- `~/.claude/channels/telegram/.token.key`
 - `~/.claude/channels/telegram/access.json`
 - `~/.claude/channels/telegram/inbox/`
 - `~/.claude/channels/telegram/*.jsonl`

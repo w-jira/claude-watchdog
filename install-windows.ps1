@@ -49,6 +49,12 @@ function Protect-PrivateFile($Path) {
     icacls $Path /inheritance:r /grant:r "$($env:USERNAME):(R,W)" *> $null
   }
 }
+function Write-EncryptedToken($Token) {
+  $secure = ConvertTo-SecureString -String $Token -AsPlainText -Force
+  $encPath = Join-Path $StateDir ".token.enc"
+  $secure | ConvertFrom-SecureString | Set-Content -Path $encPath -Encoding ASCII
+  Protect-PrivateFile $encPath
+}
 
 function Install-Dependencies {
   $missing = @()
@@ -94,9 +100,10 @@ function Write-Config {
   $envPath = Join-Path $StateDir ".env"
   if ($Token) {
     if ($Token -notmatch '^[0-9]+:[A-Za-z0-9_-]+$') { Die "Telegram bot token should look like '<bot-id>:<secret>'" }
-    Set-Content -Path $envPath -Value @("TELEGRAM_BOT_TOKEN=$Token", "CLAUDE_PERMISSION_MODE=$PermissionMode", "CLAUDE_WATCHDOG_DEMO=$([int][bool]$Demo)") -Encoding UTF8
+    Write-EncryptedToken $Token
+    Set-Content -Path $envPath -Value @("TELEGRAM_BOT_TOKEN_ENCRYPTED=1", "CLAUDE_PERMISSION_MODE=$PermissionMode", "CLAUDE_WATCHDOG_DEMO=$([int][bool]$Demo)") -Encoding UTF8
     Protect-PrivateFile $envPath
-    Log "wrote $StateDir\.env"
+    Log "wrote encrypted token and $StateDir\.env"
   } elseif (-not (Test-Path (Join-Path $StateDir ".env"))) {
     Copy-Item (Join-Path $Root "config\env.example") $envPath
     Set-EnvKey $envPath "CLAUDE_PERMISSION_MODE" $PermissionMode

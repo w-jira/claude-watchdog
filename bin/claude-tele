@@ -49,6 +49,8 @@ else
 fi
 readonly STATE_DIR="${HOME}/.claude/channels/telegram"
 readonly ENV_FILE="${STATE_DIR}/.env"
+readonly TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
+readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 # Dedicated working directory for the telegram Claude session. Keeps its
 # conversation transcripts isolated from the user's interactive $HOME session.
 readonly WORKDIR="${STATE_DIR}/workdir"
@@ -92,6 +94,20 @@ env_value() {
 }
 
 is_demo() { [ "$(env_value CLAUDE_WATCHDOG_DEMO 0)" = "1" ]; }
+
+decrypt_token() {
+  [ -s "$TOKEN_ENC_FILE" ] && [ -s "$TOKEN_KEY_FILE" ] || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  openssl enc -aes-256-cbc -d -pbkdf2 -pass "file:${TOKEN_KEY_FILE}" -in "$TOKEN_ENC_FILE" 2>/dev/null
+}
+
+telegram_token() {
+  if [ "$(env_value TELEGRAM_BOT_TOKEN_ENCRYPTED 0)" = "1" ]; then
+    decrypt_token
+    return
+  fi
+  env_value TELEGRAM_BOT_TOKEN ""
+}
 
 permission_mode() {
   local mode
@@ -261,8 +277,10 @@ cmd_exec_start() {
 
   # Build argv + shell-escape with printf %q. tmux new-session -c sets the
   # session's cwd to our isolated workdir.
-  local mode
+  local mode token
   mode="$(permission_mode)"
+  token="$(telegram_token || true)"
+  [ -n "$token" ] || die "Telegram bot token missing or encrypted token could not be decrypted"
   local -a argv=("$CLAUDE_BIN")
   if [ "$mode" = "bypassPermissions" ]; then
     argv+=(--dangerously-skip-permissions)
@@ -273,7 +291,8 @@ cmd_exec_start() {
   argv+=(--channels "plugin:telegram@claude-plugins-official")
   local cmd_str
   printf -v cmd_str '%q ' "${argv[@]}"
-  tmux new-session -d -s "$SESSION" -c "$WORKDIR" -- "$cmd_str"
+  TELEGRAM_BOT_TOKEN="$token" tmux new-session -d -s "$SESSION" -c "$WORKDIR" -- "$cmd_str"
+  unset token
 
   # [M-8] Poll the pane for first-run prompts rather than magic-sleeping.
   # There can be TWO sequential prompts on a fresh session, and we must not
@@ -619,6 +638,9 @@ cmd_doctor() {
   fi
   local_check "bot .env present"                                fatal  test -f "${STATE_DIR}/.env"
   local_check "bot .env permissions 600"                        fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/.env' 2>/dev/null) = '600' ]"
+  if [ "$(env_value TELEGRAM_BOT_TOKEN_ENCRYPTED 0)" = "1" ]; then
+    local_check "encrypted token decrypts"                       fatal  bash -c "'$0' __check-token"
+  fi
   local_check "access.json present"                             fatal  test -f "${STATE_DIR}/access.json"
   local_check "access.json permissions 600"                     fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/access.json' 2>/dev/null) = '600' ]"
   local_check "telegram plugin installed"                       fatal  bash -c "compgen -G '${HOME}/.claude/plugins/cache/*/telegram' >/dev/null"
@@ -640,6 +662,7 @@ case "${1:-status}" in
   replay-missed)  shift; cmd_replay_missed "$@" ;;
   __exec-start)   cmd_exec_start ;;
   __exec-stop)    cmd_exec_stop ;;
+  __check-token)  [ -n "$(telegram_token || true)" ] ;;
   status)         cmd_status ;;
   attach)         cmd_attach ;;
   logs)           shift; cmd_logs "$@" ;;
