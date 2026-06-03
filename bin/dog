@@ -22,19 +22,19 @@ confirm() { printf '%s [y/N] ' "$1"; read -r ans; case "$ans" in y|Y|yes|YES) re
 
 usage() {
   cat <<'EOF'
-Usage: cwd <command>
+Usage: dog <command>
 
 Commands:
   setup      Guided setup. Reads the token hidden and encrypts it at rest.
   help       Show this menu.
 
 Daily use:
-  cwd status     Show bot status.
-  cwd start      Start the bot service.
-  cwd stop       Stop the bot service.
-  cwd restart    Restart the bot service.
-  cwd doctor     Run setup diagnostics.
-  cwd logs       Show logs (blocked in demo mode unless raw is requested).
+  dog status     Show bot status.
+  dog start      Start the bot service.
+  dog stop       Stop the bot service.
+  dog restart    Restart the bot service.
+  dog doctor     Run setup diagnostics.
+  dog logs       Show logs (blocked in demo mode unless raw is requested).
 EOF
 }
 
@@ -75,9 +75,9 @@ write_env() {
 
 random_phrase() {
   if command -v openssl >/dev/null 2>&1; then
-    printf 'cwd-setup-%s\n' "$(openssl rand -hex 4)"
+    printf 'dog-setup-%s\n' "$(openssl rand -hex 4)"
   else
-    printf 'cwd-setup-%s-%s\n' "$(date +%s)" "${RANDOM}"
+    printf 'dog-setup-%s-%s\n' "$(date +%s)" "${RANDOM}"
   fi
 }
 
@@ -85,7 +85,7 @@ detect_telegram_user_id() {
   local token="$1" phrase="$2"
   command -v python3 >/dev/null 2>&1 || return 2
   python3 -c '
-import json, sys, time, urllib.parse, urllib.request
+import json, re, sys, time, urllib.parse, urllib.request
 
 token = sys.stdin.readline().rstrip("\n")
 phrase = sys.stdin.readline().rstrip("\n")
@@ -115,7 +115,17 @@ while time.time() < deadline:
         username = sender.get("username") or ""
         first = sender.get("first_name") or ""
         last = sender.get("last_name") or ""
-        print("\t".join([str(user_id), username, (first + " " + last).strip()]))
+        full_name = (first + " " + last).strip()
+        if full_name and username:
+            label = f"{full_name} (@{username})"
+        elif full_name:
+            label = full_name
+        elif username:
+            label = f"@{username}"
+        else:
+            label = "unknown name"
+        label = re.sub(r"[\x00-\x1f\x7f]+", " ", label).strip() or "unknown name"
+        print("\t".join([str(user_id), label]))
         raise SystemExit(0)
     time.sleep(1)
 raise SystemExit(1)
@@ -193,10 +203,12 @@ cmd_setup() {
     log ""
     found="$(detect_telegram_user_id "$token" "$phrase" || true)"
     if [ -n "$found" ]; then
-      user_id="${found%%$'\t'*}"
-      label="${found#*$'\t'}"
-      log "Found Telegram user ${label:-unknown} (ID ${user_id})."
-      if ! confirm "Was that you and did you send '${phrase}'?"; then
+      IFS=$'\t' read -r user_id label <<EOF
+$found
+EOF
+      log "Detected Telegram sender: ${label:-unknown name}"
+      log "Numeric Telegram user ID: ${user_id}"
+      if ! confirm "Use this Telegram account for the allowlist?"; then
         user_id=""
       fi
     else
@@ -230,13 +242,13 @@ cmd_setup() {
     "$installer" "${args[@]}"
   else
     warn "installer assets not found; updated config only"
-    warn "for first-time install, run ./bin/cwd setup from the cloned repo"
+    warn "for first-time install, run ./bin/dog setup from the cloned repo"
   fi
 }
 
 case "${1:-help}" in
   setup) cmd_setup ;;
-  status|start|stop|restart|doctor|logs) command -v claude-tele >/dev/null 2>&1 || die "claude-tele not installed yet; run: cwd setup"; claude-tele "$@" ;;
+  status|start|stop|restart|doctor|logs) command -v claude-tele >/dev/null 2>&1 || die "claude-tele not installed yet; run: dog setup"; claude-tele "$@" ;;
   help|-h|--help) usage ;;
   *) die "unknown command: $1" ;;
 esac

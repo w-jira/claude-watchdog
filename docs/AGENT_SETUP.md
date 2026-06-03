@@ -5,7 +5,7 @@ This file is for AI agents, CI jobs, and scripted installs.
 For a human at a terminal, use the safer path instead:
 
 ```bash
-./bin/cwd setup
+./bin/dog setup
 ```
 
 The wizard hides the Telegram token, encrypts it at rest when OpenSSL is available, and avoids putting secrets in command arguments.
@@ -16,7 +16,7 @@ Ask the user for only these values:
 
 - target OS: Linux, macOS, Windows native, or Windows WSL2
 - Telegram bot token from BotFather
-- your numeric Telegram user ID, or permission to auto-detect it from a one-time test message during `cwd setup`
+- your numeric Telegram user ID, or permission to auto-detect it from a one-time test message during `dog setup`
 - whether dependency installation is allowed
 - Claude permission mode, usually `default`
 - whether demo mode should be enabled
@@ -56,8 +56,8 @@ Remove-Item Env:TELEGRAM_USER_ID -ErrorAction SilentlyContinue
 Linux/macOS:
 
 ```bash
-cwd doctor
-cwd status
+dog doctor
+dog status
 ```
 
 Windows:
@@ -69,8 +69,9 @@ powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\clau
 
 ## Security notes for agents
 
-- Prefer `./bin/cwd setup` when you can interact with the terminal directly.
+- Prefer `./bin/dog setup` when you can interact with the terminal directly.
 - Non-interactive setup may expose tokens through shell history, process environments, terminal logs, or agent transcripts.
+- Linux/macOS encrypted token storage uses a private colocated key file; it prevents plaintext `.env` storage but does not protect against a compromised OS account.
 - Never use real tokens in examples, summaries, PR descriptions, or test fixtures.
 - After setup, inspect only redacted output. Do not read `.env`, `.token.key`, `.token.enc`, or `access.json` unless the task explicitly requires it.
 - If a token may have been exposed, rotate it in BotFather.

@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="${HOME}/.claude/channels/telegram"
 WORKDIR="${STATE_DIR}/workdir"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
+TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
+TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 BUN_VERSION="${BUN_VERSION:-bun-v1.3.14}"
 INSTALL_DEPS=0
 START_SERVICE=0
@@ -27,7 +29,7 @@ Options:
   --telegram-user-id ID       Allow this Telegram user ID in access.json.
   --permission-mode MODE       Claude permission mode: default, plan, acceptEdits, auto, dontAsk, bypassPermissions.
   --demo                      Hide sensitive status/log details for demos.
-  --menu                      Run the interactive setup wizard (same as ./bin/cwd setup).
+  --menu                      Run the interactive setup wizard (same as ./bin/dog setup).
   --start                     Start the systemd user service after install.
   -y, --yes                   Non-interactive yes for supported install steps.
   -h, --help                  Show this help.
@@ -182,18 +184,52 @@ set_env_key() {
   rm -f "$tmp"
 }
 
+encrypt_token() {
+  local token="$1"
+  has openssl || return 1
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  if [ ! -s "$TOKEN_KEY_FILE" ]; then
+    openssl rand -base64 48 > "$TOKEN_KEY_FILE"
+    chmod 600 "$TOKEN_KEY_FILE"
+  fi
+  printf '%s' "$token" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${TOKEN_KEY_FILE}" -out "$TOKEN_ENC_FILE"
+  chmod 600 "$TOKEN_ENC_FILE"
+}
+
+remove_legacy_cwd() {
+  local legacy="${HOME}/bin/cwd"
+  [ -e "$legacy" ] || return 0
+  if [ -f "$legacy" ] && grep -q "claude-watchdog setup" "$legacy" 2>/dev/null; then
+    rm -f "$legacy"
+    log "removed legacy ${legacy}; use dog instead"
+  else
+    warn "legacy ${legacy} exists but was not recognized as claude-watchdog; leaving it untouched"
+  fi
+}
+
 write_env() {
   validate_permission_mode
   if [ -n "$BOT_TOKEN" ]; then
     [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Telegram bot token should look like '<bot-id>:<secret>'"
     umask 077
-    {
-      printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN"
-      printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
-      printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
-    } > "${STATE_DIR}/.env"
+    if encrypt_token "$BOT_TOKEN"; then
+      {
+        printf 'TELEGRAM_BOT_TOKEN_ENCRYPTED=1\n'
+        printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
+        printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
+      } > "${STATE_DIR}/.env"
+      log "wrote encrypted token and ${STATE_DIR}/.env"
+    else
+      warn "openssl not found; storing token in private plaintext .env instead of encrypted token file"
+      {
+        printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN"
+        printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
+        printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
+      } > "${STATE_DIR}/.env"
+      log "wrote ${STATE_DIR}/.env"
+    fi
     chmod 600 "${STATE_DIR}/.env"
-    log "wrote ${STATE_DIR}/.env"
   elif [ ! -f "${STATE_DIR}/.env" ]; then
     install -m 600 "${ROOT}/config/env.example" "${STATE_DIR}/.env"
     set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
@@ -233,7 +269,7 @@ PY
   fi
 }
 
-[ "$MENU" = "1" ] && exec "${ROOT}/bin/cwd" setup
+[ "$MENU" = "1" ] && exec "${ROOT}/bin/dog" setup
 
 if [ "$INSTALL_DEPS" = "1" ]; then
   install_apt_deps
@@ -244,7 +280,8 @@ mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
 
 install -m 700 "${ROOT}/bin/claude-tele" "${HOME}/bin/claude-tele"
-install -m 700 "${ROOT}/bin/cwd" "${HOME}/bin/cwd"
+install -m 700 "${ROOT}/bin/dog" "${HOME}/bin/dog"
+remove_legacy_cwd
 install -m 700 "${ROOT}/bin/claude-tele-watchdog" "${HOME}/bin/claude-tele-watchdog"
 install -m 700 "${ROOT}/bin/claude-tele-patch-telegram-plugin" "${HOME}/bin/claude-tele-patch-telegram-plugin"
 install -m 700 "${ROOT}/bin/claude-tele-replay-missed" "${HOME}/bin/claude-tele-replay-missed"

@@ -7,15 +7,15 @@ Run Claude Code from Telegram without babysitting a terminal.
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
-./bin/cwd setup
+./bin/dog setup
 ```
 
 After install:
 
 ```bash
-cwd status
-cwd logs
-cwd restart
+dog status
+dog logs
+dog restart
 ```
 
 ## Why this exists
@@ -38,7 +38,7 @@ Use the CLI wizard. It keeps the bot token out of shell history and command argu
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
-./bin/cwd setup
+./bin/dog setup
 ```
 
 The wizard asks for:
@@ -50,19 +50,21 @@ The wizard asks for:
 - whether to install missing dependencies
 - whether to start the bot immediately
 
-By default, `cwd setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
+By default, `dog setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
+
+The Linux/macOS encryption key is stored in the same private state directory as the encrypted token. This removes the token from `.env` and casual text exposure, but it does not protect against malware, a compromised OS account, or backups that include both `.token.enc` and `.token.key`.
 
 ## Daily commands
 
 ```bash
-cwd help       # friendly command menu
-cwd setup      # guided setup or reconfiguration
-cwd status     # service + bot status
-cwd start      # start the bot
-cwd stop       # stop the bot
-cwd restart    # restart the bot
-cwd doctor     # diagnostics
-cwd logs       # logs; blocked in demo mode unless raw is requested
+dog help       # friendly command menu
+dog setup      # guided setup or reconfiguration
+dog status     # service + bot status
+dog start      # start the bot
+dog stop       # stop the bot
+dog restart    # restart the bot
+dog doctor     # diagnostics
+dog logs       # logs; blocked in demo mode unless raw is requested
 ```
 
 Linux still exposes the lower-level power-user CLI:
@@ -85,9 +87,9 @@ Before the bot can run, you need:
 
 - Claude Code CLI installed and authenticated
 - a Telegram bot token from BotFather
-- your Telegram user ID; `cwd setup` can detect it automatically from a one-time test message
+- your Telegram user ID; `dog setup` can detect it automatically from a one-time test message
 
-Linux full mode also needs `systemd --user`. On Debian/Ubuntu, `cwd setup` can install supported dependencies when you approve it.
+Linux full mode also needs `systemd --user`. On Debian/Ubuntu, `dog setup` can install supported dependencies when you approve it.
 
 ## Permissions
 
@@ -118,7 +120,7 @@ Use the dedicated agent setup guide instead:
 
 - [docs/AGENT_SETUP.md](docs/AGENT_SETUP.md)
 
-That file contains the non-interactive commands and the security caveats. The main path for humans is still `./bin/cwd setup`.
+That file contains the non-interactive commands and the security caveats. The main path for humans is still `./bin/dog setup`.
 
 ## Manual install commands
 
@@ -146,7 +148,7 @@ $env:TELEGRAM_USER_ID = "<telegram-user-id>"
 .\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
 ```
 
-These paths are useful for agents and CI, but they are less safe for humans because tokens can land in shell history or process environments. Prefer `cwd setup` when you are at a terminal.
+These paths are useful for agents and CI, but they are less safe for humans because tokens can land in shell history or process environments. Prefer `dog setup` when you are at a terminal.
 
 ## Security model
 
@@ -155,7 +157,8 @@ These paths are useful for agents and CI, but they are less safe for humans beca
 - token input is hidden in the setup wizard
 - token is not passed to child installers as an argument
 - generated config files are private (`0600` on Linux/macOS, restricted ACLs on Windows)
-- `cwd setup` encrypts the bot token at rest when OpenSSL is available
+- `dog setup` encrypts the bot token at rest when OpenSSL is available
+- Linux/macOS keep the token encryption key next to the encrypted token, so OS-account security still matters
 - `.env` is parsed as data, never sourced or evaluated
 - Telegram access is allowlisted by user ID
 - the Claude session runs from an isolated workdir
@@ -175,4 +178,4 @@ Validation checks shell syntax, Python syntax, user-systemd unit validity, and c
 - Run only one poller per Telegram bot token.
 - Do not commit `.env`, `.token.enc`, `.token.key`, `access.json`, transcripts, inbox files, PID files, locks, or plugin cache contents.
 - Keep the Telegram workdir stable unless you intentionally want a new transcript lineage.
-- Use `cwd doctor` before debugging a failed install.
+- Use `dog doctor` before debugging a failed install.
