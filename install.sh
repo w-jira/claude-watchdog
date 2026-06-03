@@ -117,6 +117,33 @@ install_bun() {
   ln -sfn "${HOME}/.bun/bin/bun" "${HOME}/bin/bun"
 }
 
+ensure_claude_symlink() {
+  # claude-tele expects ${HOME}/.local/bin/claude (also on the service's PATH).
+  # Many installs place claude at /usr/local/bin or behind a version manager,
+  # which makes the hardcoded path — and the service — fail to find it. Symlink
+  # the resolved binary so both the expected path and the service PATH work.
+  [ -x "${HOME}/.local/bin/claude" ] && return 0
+  local resolved
+  resolved="$(command -v claude 2>/dev/null || true)"
+  [ -n "$resolved" ] || return 0
+  install -d -m 755 "${HOME}/.local/bin"
+  ln -sfn "$resolved" "${HOME}/.local/bin/claude"
+  log "linked ${HOME}/.local/bin/claude -> ${resolved}"
+}
+
+install_plugin() {
+  # The Telegram channel depends on the official telegram plugin. Without this
+  # the bridge silently never starts on a clean machine. Idempotent: both the
+  # marketplace add and the install are safe to repeat.
+  has claude || { warn "claude not found; skipping telegram plugin install — install/authenticate Claude Code, then re-run"; return 0; }
+  claude plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 || true
+  if claude plugin install telegram@claude-plugins-official >/dev/null 2>&1; then
+    log "installed plugin telegram@claude-plugins-official"
+  else
+    warn "could not auto-install the telegram plugin — run: claude plugin install telegram@claude-plugins-official"
+  fi
+}
+
 write_env() {
   if [ -n "$BOT_TOKEN" ]; then
     case "$BOT_TOKEN" in
@@ -176,6 +203,9 @@ install -m 700 "${ROOT}/bin/claude-tele-replay-missed" "${HOME}/bin/claude-tele-
 install -m 700 "${ROOT}/bin/claude-tele-control-mcp.py" "${HOME}/bin/claude-tele-control-mcp.py"
 install -m 600 "${ROOT}/systemd/user/telegram-claude.service" "${SYSTEMD_DIR}/telegram-claude.service"
 install -m 600 "${ROOT}/systemd/user/telegram-claude-watchdog.service" "${SYSTEMD_DIR}/telegram-claude-watchdog.service"
+
+ensure_claude_symlink
+install_plugin
 
 write_env
 write_access

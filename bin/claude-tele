@@ -36,7 +36,17 @@ set -euo pipefail
 readonly SESSION="telegram-claude"
 readonly SERVICE="telegram-claude.service"
 readonly WATCHDOG_SERVICE="telegram-claude-watchdog.service"
-readonly CLAUDE_BIN="${HOME}/.local/bin/claude"
+# Resolve claude: prefer ${HOME}/.local/bin/claude (what install.sh links), but
+# fall back to whatever is on PATH — common installs land in /usr/local/bin or
+# behind a version manager. Avoids a fatal "claude binary missing" on a working
+# Claude that simply lives elsewhere.
+if [ -x "${HOME}/.local/bin/claude" ]; then
+  readonly CLAUDE_BIN="${HOME}/.local/bin/claude"
+elif _resolved_claude="$(command -v claude 2>/dev/null)"; then
+  readonly CLAUDE_BIN="$_resolved_claude"
+else
+  readonly CLAUDE_BIN="${HOME}/.local/bin/claude"
+fi
 readonly STATE_DIR="${HOME}/.claude/channels/telegram"
 # Dedicated working directory for the telegram Claude session. Keeps its
 # conversation transcripts isolated from the user's interactive $HOME session.
@@ -559,6 +569,7 @@ cmd_doctor() {
   local_check "bot .env permissions 600"                        fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/.env' 2>/dev/null) = '600' ]"
   local_check "access.json present"                             fatal  test -f "${STATE_DIR}/access.json"
   local_check "access.json permissions 600"                     fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/access.json' 2>/dev/null) = '600' ]"
+  local_check "telegram plugin installed"                       fatal  bash -c "compgen -G '${HOME}/.claude/plugins/cache/*/telegram' >/dev/null"
   local_check "service enabled on boot"                         soft   systemctl --user is-enabled --quiet "$SERVICE"
   local_check "watchdog enabled on boot"                        soft   systemctl --user is-enabled --quiet "$WATCHDOG_SERVICE"
   local_check "lingering enabled (survives logout) · fix: sudo loginctl enable-linger \$(id -un)" \
