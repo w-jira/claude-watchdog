@@ -131,13 +131,23 @@ ensure_claude_symlink() {
   log "linked ${HOME}/.local/bin/claude -> ${resolved}"
 }
 
+plugin_installed() {
+  compgen -G "${HOME}/.claude/plugins/cache/*/telegram" >/dev/null
+}
+
 install_plugin() {
   # The Telegram channel depends on the official telegram plugin. Without this
   # the bridge silently never starts on a clean machine. Idempotent: both the
   # marketplace add and the install are safe to repeat.
-  has claude || { warn "claude not found; skipping telegram plugin install — install/authenticate Claude Code, then re-run"; return 0; }
-  claude plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 || true
-  if claude plugin install telegram@claude-plugins-official >/dev/null 2>&1; then
+  local claude_bin
+  claude_bin="$(command -v claude 2>/dev/null || true)"
+  if [ -z "$claude_bin" ] && [ -x "${HOME}/.local/bin/claude" ]; then
+    claude_bin="${HOME}/.local/bin/claude"
+  fi
+  [ -n "$claude_bin" ] || { warn "claude not found; skipping telegram plugin install — install/authenticate Claude Code, then re-run"; return 0; }
+
+  "$claude_bin" plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 || true
+  if "$claude_bin" plugin install telegram@claude-plugins-official >/dev/null 2>&1 || plugin_installed; then
     log "installed plugin telegram@claude-plugins-official"
   else
     warn "could not auto-install the telegram plugin — run: claude plugin install telegram@claude-plugins-official"
@@ -223,7 +233,8 @@ if [ "${#missing[@]}" -gt 0 ]; then
 fi
 
 if [ "$START_SERVICE" = "1" ]; then
-  has claude || die "claude CLI is missing; install and authenticate it before --start"
+  has claude || [ -x "${HOME}/.local/bin/claude" ] || die "claude CLI is missing; install and authenticate it before --start"
+  plugin_installed || die "telegram plugin is not installed; run: claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install telegram@claude-plugins-official"
   [ -s "${STATE_DIR}/.env" ] || die "missing ${STATE_DIR}/.env"
   [ -s "${STATE_DIR}/access.json" ] || die "missing ${STATE_DIR}/access.json"
   "${HOME}/bin/claude-tele" start
