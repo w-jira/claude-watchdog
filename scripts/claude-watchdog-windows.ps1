@@ -3,7 +3,8 @@
 param(
   [Parameter(Position = 0)]
   [ValidateSet("run", "start", "stop", "restart", "status", "logs", "doctor")]
-  [string]$Command = "status"
+  [string]$Command = "status",
+  [switch]$Raw
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,11 +14,31 @@ $PidFile = Join-Path $StateDir "claude.pid"
 $OutLog = Join-Path $StateDir "claude-watchdog.out.log"
 $ErrLog = Join-Path $StateDir "claude-watchdog.err.log"
 $TaskName = "ClaudeWatchdogTelegram"
+$EnvFile = Join-Path $StateDir ".env"
 
 function Log($Message) { Write-Host "[claude-watchdog] $Message" }
 function Warn($Message) { Write-Warning "[claude-watchdog] $Message" }
 function Die($Message) { throw "[claude-watchdog] $Message" }
 function HasCommand($Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+function Get-EnvValue($Name, $Default) {
+  if (-not (Test-Path $EnvFile)) { return $Default }
+  $line = Get-Content $EnvFile -ErrorAction SilentlyContinue | Where-Object { $_ -like "$Name=*" } | Select-Object -Last 1
+  if (-not $line) { return $Default }
+  return ($line.Substring($Name.Length + 1)).Trim('"', "'")
+}
+function Test-DemoMode { (Get-EnvValue "CLAUDE_WATCHDOG_DEMO" "0") -eq "1" }
+function Get-PermissionArgs {
+  $mode = Get-EnvValue "CLAUDE_PERMISSION_MODE" "bypassPermissions"
+  switch ($mode) {
+    "bypassPermissions" { return @("--dangerously-skip-permissions") }
+    "default" { return @("--permission-mode", "default") }
+    "plan" { return @("--permission-mode", "plan") }
+    "acceptEdits" { return @("--permission-mode", "acceptEdits") }
+    "auto" { return @("--permission-mode", "auto") }
+    "dontAsk" { return @("--permission-mode", "dontAsk") }
+    default { Warn "invalid CLAUDE_PERMISSION_MODE=$mode; using default"; return @("--permission-mode", "default") }
+  }
+}
 
 function Get-ClaudeProcess {
   if (-not (Test-Path $PidFile)) { return $null }
@@ -47,7 +68,7 @@ function Start-ClaudeLoop {
       # across shells, and a broad --continue can resume the user's unrelated
       # interactive session. WSL2/Linux mode provides full transcript-resume
       # parity today.
-      $args = @("--dangerously-skip-permissions", "--channels", "plugin:telegram@claude-plugins-official")
+      $args = @() + (Get-PermissionArgs) + @("--channels", "plugin:telegram@claude-plugins-official")
       $proc = Start-Process -FilePath "claude" -ArgumentList $args -NoNewWindow -PassThru -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog
       Set-Content -Path $PidFile -Value $proc.Id -Encoding ASCII
       $proc.WaitForExit()
@@ -75,11 +96,12 @@ function Show-Status {
   $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if ($task) { Log "task: $($task.State)" } else { Warn "task: not registered" }
   $proc = Get-ClaudeProcess
-  if ($proc) { Log "claude: pid $($proc.Id)" } else { Warn "claude: not running" }
+  if ($proc) { if (Test-DemoMode) { Log "claude: running (details hidden)" } else { Log "claude: pid $($proc.Id)" } } else { Warn "claude: not running" }
   if (Test-PluginInstalled) { Log "telegram plugin: installed" } else { Warn "telegram plugin: missing" }
 }
 
 function Show-Logs {
+  if ((Test-DemoMode) -and (-not $Raw)) { Die "demo mode hides logs to avoid leaking prompts, paths, or tokens; use logs -Raw" }
   foreach ($path in @($OutLog, $ErrLog)) {
     if (Test-Path $path) {
       Write-Host "--- $path ---"

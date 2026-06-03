@@ -6,6 +6,7 @@ readonly SESSION="telegram-claude"
 readonly LABEL="com.claude-watchdog.telegram"
 readonly PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 readonly STATE_DIR="${HOME}/.claude/channels/telegram"
+readonly ENV_FILE="${STATE_DIR}/.env"
 readonly WORKDIR="${STATE_DIR}/workdir"
 readonly BOT_PID_FILE="${STATE_DIR}/bot.pid"
 readonly OUT_LOG="${STATE_DIR}/launchd.out.log"
@@ -29,6 +30,33 @@ warn() { echo "${YELLOW}warn:${RESET} $*" >&2; }
 ok()   { echo "${GREEN}✓${RESET} $*"; }
 info() { echo "${BLUE}→${RESET} $*"; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+env_value() {
+  local key="$1" default="${2:-}" line value
+  [ -r "$ENV_FILE" ] || { printf '%s
+' "$default"; return 0; }
+  line=$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 || true)
+  [ -n "$line" ] || { printf '%s
+' "$default"; return 0; }
+  value="${line#*=}"
+  value="${value%"}"; value="${value#"}"
+  value="${value%'}"; value="${value#'}"
+  printf '%s
+' "$value"
+}
+
+is_demo() { [ "$(env_value CLAUDE_WATCHDOG_DEMO 0)" = "1" ]; }
+
+permission_mode() {
+  local mode
+  mode="$(env_value CLAUDE_PERMISSION_MODE bypassPermissions)"
+  case "$mode" in
+    acceptEdits|auto|bypassPermissions|default|dontAsk|plan) printf '%s
+' "$mode" ;;
+    *) warn "invalid CLAUDE_PERMISSION_MODE=${mode}; using default"; printf 'default
+' ;;
+  esac
+}
 
 mkdir -p "$STATE_DIR" "$WORKDIR" && chmod 700 "$STATE_DIR" "$WORKDIR"
 
@@ -123,7 +151,14 @@ cmd_exec_start() {
     echo "no prior transcript — starting fresh session"
   fi
 
-  local -a argv=("$CLAUDE_BIN" --dangerously-skip-permissions)
+  local mode
+  mode="$(permission_mode)"
+  local -a argv=("$CLAUDE_BIN")
+  if [ "$mode" = "bypassPermissions" ]; then
+    argv+=(--dangerously-skip-permissions)
+  else
+    argv+=(--permission-mode "$mode")
+  fi
   [ -n "$resume_flag" ] && argv+=("$resume_flag")
   argv+=(--channels "plugin:telegram@claude-plugins-official")
   local cmd_str
@@ -170,20 +205,35 @@ cmd_restart() { cmd_stop; cmd_start; }
 
 cmd_status() {
   echo "${BLUE}── claude-tele macOS status ──${RESET}"
+  is_demo && ok "demo:    on (sensitive details hidden)"
   service_loaded && ok "launchd: loaded" || echo "${YELLOW}○ launchd: not loaded${RESET}"
   session_exists && ok "tmux:    '${SESSION}' present" || echo "${RED}✗ tmux:    '${SESSION}' missing${RESET}"
-  [ -x "$CLAUDE_BIN" ] && ok "claude:  ${CLAUDE_BIN}" || echo "${RED}✗ claude:  missing at ${CLAUDE_BIN}${RESET}"
+  if is_demo; then
+    [ -x "$CLAUDE_BIN" ] && ok "claude:  configured" || echo "${RED}✗ claude:  missing${RESET}"
+  else
+    [ -x "$CLAUDE_BIN" ] && ok "claude:  ${CLAUDE_BIN}" || echo "${RED}✗ claude:  missing at ${CLAUDE_BIN}${RESET}"
+  fi
   bun_alive && ok "bun:     plugin bridge running" || echo "${YELLOW}○ bun:     not detected${RESET}"
 }
 
 cmd_attach() { session_exists || die "session not running · start with: claude-tele start"; exec tmux attach -t "$SESSION"; }
-cmd_logs() { tail -n 100 ${1:-} "$OUT_LOG" "$ERR_LOG" 2>/dev/null || true; }
+cmd_logs() {
+  if is_demo && [ "${1:-}" != "--raw" ]; then
+    die "demo mode hides logs to avoid leaking prompts, paths, or tokens; use: claude-tele logs --raw"
+  fi
+  [ "${1:-}" = "--raw" ] && shift
+  tail -n 100 ${1:-} "$OUT_LOG" "$ERR_LOG" 2>/dev/null || true
+}
 cmd_heal() { if ! bun_alive; then warn "bun bridge missing — restarting"; cmd_restart; else ok "nothing to heal"; fi; }
 cmd_doctor() {
   echo "${BLUE}── claude-tele macOS doctor ──${RESET}"
   need tmux; ok "tmux installed"
   bun --version >/dev/null 2>&1 && ok "bun runs" || die "bun missing or broken"
-  [ -x "$CLAUDE_BIN" ] && ok "claude binary at ${CLAUDE_BIN}" || die "claude binary missing: ${CLAUDE_BIN}"
+  if is_demo; then
+    [ -x "$CLAUDE_BIN" ] && ok "claude binary configured" || die "claude binary missing"
+  else
+    [ -x "$CLAUDE_BIN" ] && ok "claude binary at ${CLAUDE_BIN}" || die "claude binary missing: ${CLAUDE_BIN}"
+  fi
   [ -f "${STATE_DIR}/.env" ] && ok "bot .env present" || die "missing ${STATE_DIR}/.env"
   [ -f "${STATE_DIR}/access.json" ] && ok "access.json present" || die "missing ${STATE_DIR}/access.json"
   compgen -G "${HOME}/.claude/plugins/cache/*/telegram" >/dev/null && ok "telegram plugin installed" || die "telegram plugin missing"

@@ -52,12 +52,20 @@ Optional:
 
 ### Linux
 
+Interactive setup app (recommended because the bot token is hidden and never passed as a command-line argument):
+
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
+./bin/cwd setup
+```
+
+Agent/non-interactive:
+
+```bash
 TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
 TELEGRAM_USER_ID='123456789' \
-  ./install.sh --install-deps --start --yes
+  ./install.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
 ### macOS
@@ -67,7 +75,7 @@ git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
 TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
 TELEGRAM_USER_ID='123456789' \
-  ./install-macos.sh --install-deps --start --yes
+  ./install-macos.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
 ### Windows PowerShell
@@ -77,7 +85,7 @@ git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
 $env:TELEGRAM_BOT_TOKEN = "replace-with-botfather-token"
 $env:TELEGRAM_USER_ID = "123456789"
-.\install-windows.ps1 -InstallDeps -Start -Yes
+.\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
 ```
 
 On Windows, if Claude exits or hangs on a first-run trust/permissions prompt, run this once in an interactive terminal from `%USERPROFILE%\.claude\channels\telegram\workdir`, accept the prompts, then restart the task:
@@ -116,14 +124,14 @@ Recommended Linux agent command:
 
 ```bash
 TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
-  ./install.sh --install-deps --start --yes
+  ./install.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
 Recommended macOS agent command:
 
 ```bash
 TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
-  ./install-macos.sh --install-deps --start --yes
+  ./install-macos.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
 Recommended Windows PowerShell agent command:
@@ -131,7 +139,7 @@ Recommended Windows PowerShell agent command:
 ```powershell
 $env:TELEGRAM_BOT_TOKEN = "<bot-token>"
 $env:TELEGRAM_USER_ID = "<telegram-user-id>"
-.\install-windows.ps1 -InstallDeps -Start -Yes
+.\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
 ```
 
 The installers are idempotent: re-running them updates scripts/services and preserves existing config unless token/user ID are explicitly provided.
@@ -173,6 +181,8 @@ Example `.env`:
 
 ```bash
 TELEGRAM_BOT_TOKEN=replace-with-botfather-token
+CLAUDE_PERMISSION_MODE=default
+CLAUDE_WATCHDOG_DEMO=0
 ```
 
 Example `access.json`:
@@ -221,12 +231,27 @@ Get-Help .\install-windows.ps1
 Common options:
 
 - `--install-deps` / `-InstallDeps`: install missing supported dependencies.
-- `--token TOKEN` / `-Token TOKEN`: write Telegram bot token.
+- `--token TOKEN` / `-Token TOKEN`: write Telegram bot token. Prefer `./bin/cwd setup` so the token is hidden and not placed in shell history or process arguments.
 - `--telegram-user-id ID` / `-TelegramUserId ID`: write allowlist config.
+- `--permission-mode MODE` / `-PermissionMode MODE`: choose Claude permissions (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`, or `bypassPermissions`). Use `default` for safe demos; use `bypassPermissions` only in sandboxes.
+- `--demo` / `-Demo`: hide sensitive runtime details in status output and block logs unless explicitly requested raw.
 - `--start` / `-Start`: start the bot after install.
 - `--yes` / `-Yes`: non-interactive yes for supported install steps.
 
+Linux/macOS also support `./bin/cwd setup`, a small interactive CLI app for token, Telegram user ID, permission level, demo mode, dependency install, and start/no-start. It reads the bot token with hidden input, writes config files with `0600` permissions, and does not pass the token as a command-line argument.
+
 ## Commands
+
+Friendly CLI:
+
+```bash
+cwd setup
+cwd status
+cwd start
+cwd stop
+cwd restart
+cwd doctor
+```
 
 Linux full mode:
 

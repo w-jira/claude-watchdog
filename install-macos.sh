@@ -6,6 +6,8 @@ STATE_DIR="${HOME}/.claude/channels/telegram"
 WORKDIR="${STATE_DIR}/workdir"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
+DEMO_MODE="${CLAUDE_WATCHDOG_DEMO:-0}"
+PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
 START_SERVICE=0
 INSTALL_DEPS=0
 YES=0
@@ -20,6 +22,8 @@ Options:
   --install-deps              Install missing deps with Homebrew where available.
   --token TOKEN               Write Telegram bot token to ~/.claude/channels/telegram/.env.
   --telegram-user-id ID       Allow this Telegram user ID in access.json.
+  --permission-mode MODE       Claude permission mode: default, plan, acceptEdits, auto, dontAsk, bypassPermissions.
+  --demo                      Hide sensitive status/log details for demos.
   --start                     Start the launchd service after install.
   -y, --yes                   Non-interactive yes for supported install steps.
   -h, --help                  Show this help.
@@ -38,9 +42,11 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --install-deps) INSTALL_DEPS=1 ;;
     --start) START_SERVICE=1 ;;
+    --demo) DEMO_MODE=1 ;;
     -y|--yes) YES=1 ;;
     --token) shift; BOT_TOKEN="${1:-}" ;;
     --telegram-user-id) shift; TELEGRAM_USER_ID="${1:-}" ;;
+    --permission-mode) shift; PERMISSION_MODE="${1:-}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -52,6 +58,16 @@ warn() { printf '[claude-watchdog] warning: %s\n' "$*" >&2; }
 die() { printf '[claude-watchdog] error: %s\n' "$*" >&2; exit 1; }
 has() { command -v "$1" >/dev/null 2>&1; }
 confirm() { [ "$YES" = "1" ] && return 0; printf '%s [y/N] ' "$1"; read -r ans; case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+validate_permission_mode() { case "$PERMISSION_MODE" in default|plan|acceptEdits|auto|dontAsk|bypassPermissions) return 0 ;; *) die "invalid permission mode: ${PERMISSION_MODE}" ;; esac; }
+set_env_key() {
+  local key="$1" value="$2" file="${STATE_DIR}/.env" tmp
+  tmp="$(mktemp)"
+  [ -f "$file" ] && grep -v "^${key}=" "$file" > "$tmp" || true
+  printf '%s=%s
+' "$key" "$value" >> "$tmp"
+  install -m 600 "$tmp" "$file"
+  rm -f "$tmp"
+}
 
 [ "$(uname -s)" = "Darwin" ] || die "install-macos.sh must be run on macOS"
 
@@ -105,15 +121,25 @@ install_plugin() {
 }
 
 write_env() {
+  validate_permission_mode
   if [ -n "$BOT_TOKEN" ]; then
-    case "$BOT_TOKEN" in *:*) ;; *) die "Telegram bot token should look like '<bot-id>:<secret>'" ;; esac
+    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Telegram bot token should look like '<bot-id>:<secret>'"
     umask 077
-    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN" > "${STATE_DIR}/.env"
+    {
+      printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN"
+      printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
+      printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
+    } > "${STATE_DIR}/.env"
     chmod 600 "${STATE_DIR}/.env"
     log "wrote ${STATE_DIR}/.env"
   elif [ ! -f "${STATE_DIR}/.env" ]; then
     install -m 600 "${ROOT}/config/env.example" "${STATE_DIR}/.env"
+    set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
+    set_env_key "CLAUDE_WATCHDOG_DEMO" "$DEMO_MODE"
     warn "created ${STATE_DIR}/.env — edit TELEGRAM_BOT_TOKEN before starting"
+  else
+    set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
+    set_env_key "CLAUDE_WATCHDOG_DEMO" "$DEMO_MODE"
   fi
 }
 
@@ -140,6 +166,7 @@ install_deps
 mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
 install -m 700 "${ROOT}/bin/claude-tele-macos" "${HOME}/bin/claude-tele"
+install -m 700 "${ROOT}/bin/cwd" "${HOME}/bin/cwd"
 ensure_claude_symlink
 install_plugin
 write_env

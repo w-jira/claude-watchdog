@@ -48,6 +48,7 @@ else
   readonly CLAUDE_BIN="${HOME}/.local/bin/claude"
 fi
 readonly STATE_DIR="${HOME}/.claude/channels/telegram"
+readonly ENV_FILE="${STATE_DIR}/.env"
 # Dedicated working directory for the telegram Claude session. Keeps its
 # conversation transcripts isolated from the user's interactive $HOME session.
 readonly WORKDIR="${STATE_DIR}/workdir"
@@ -77,10 +78,33 @@ info() { echo "${BLUE}→${RESET} $*"; }
 
 # ── Preflight ──────────────────────────────────────────────────────────────
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# Read simple KEY=value settings from the bot .env without eval/source.
+env_value() {
+  local key="$1" default="${2:-}" line value
+  [ -r "$ENV_FILE" ] || { printf '%s\n' "$default"; return 0; }
+  line=$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 || true)
+  [ -n "$line" ] || { printf '%s\n' "$default"; return 0; }
+  value="${line#*=}"
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  printf '%s\n' "$value"
+}
+
+is_demo() { [ "$(env_value CLAUDE_WATCHDOG_DEMO 0)" = "1" ]; }
+
+permission_mode() {
+  local mode
+  mode="$(env_value CLAUDE_PERMISSION_MODE bypassPermissions)"
+  case "$mode" in
+    acceptEdits|auto|bypassPermissions|default|dontAsk|plan) printf '%s\n' "$mode" ;;
+    *) warn "invalid CLAUDE_PERMISSION_MODE=${mode}; using default"; printf 'default\n' ;;
+  esac
+}
 need tmux
 need systemctl
 need flock
-[ -x "$CLAUDE_BIN" ] || die "claude binary missing: $CLAUDE_BIN"
+[ -x "$CLAUDE_BIN" ] || { is_demo && die "claude binary missing" || die "claude binary missing: $CLAUDE_BIN"; }
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 
 # ── Health predicates ──────────────────────────────────────────────────────
@@ -237,7 +261,14 @@ cmd_exec_start() {
 
   # Build argv + shell-escape with printf %q. tmux new-session -c sets the
   # session's cwd to our isolated workdir.
-  local -a argv=("$CLAUDE_BIN" --dangerously-skip-permissions)
+  local mode
+  mode="$(permission_mode)"
+  local -a argv=("$CLAUDE_BIN")
+  if [ "$mode" = "bypassPermissions" ]; then
+    argv+=(--dangerously-skip-permissions)
+  else
+    argv+=(--permission-mode "$mode")
+  fi
   [ -n "$resume_flag" ] && argv+=("$resume_flag")
   argv+=(--channels "plugin:telegram@claude-plugins-official")
   local cmd_str
@@ -406,6 +437,7 @@ cmd_restart() {
 
 cmd_status() {
   echo "${BLUE}── claude-tele status ──${RESET}"
+  is_demo && ok "demo:     on (sensitive details hidden)"
   if svc_active; then ok "service:  ${GREEN}active${RESET}"; else echo "${YELLOW}○ service:  inactive${RESET}"; fi
   if wd_active;  then ok "watchdog: ${GREEN}active${RESET}"; else echo "${YELLOW}○ watchdog: inactive${RESET}"; fi
   if session_exists; then ok "tmux:     '${SESSION}' present"; else echo "${RED}✗ tmux:     '${SESSION}' missing${RESET}"; fi
@@ -418,7 +450,11 @@ cmd_status() {
     if [ -n "$cpid" ]; then
       local rss
       rss=$(awk '/VmRSS/ {printf "%.0f MB", $2/1024}' "/proc/${cpid}/status" 2>/dev/null) || rss="?"
-      ok "claude:   pid ${cpid} · rss ${rss}"
+      if is_demo; then
+        ok "claude:   running (details hidden)"
+      else
+        ok "claude:   pid ${cpid} · rss ${rss}"
+      fi
     else
       echo "${YELLOW}○ claude:   process not found in tmux tree${RESET}"
     fi
@@ -433,7 +469,7 @@ cmd_status() {
     # Report the PID from bot.pid when available, else the first matching bun.
     local bp=""
     if [ -r "$BOT_PID_FILE" ]; then bp=$(cat "$BOT_PID_FILE" 2>/dev/null) || bp=""; fi
-    ok "bun:      pid ${bp:-?} (plugin bridge)"
+    is_demo && ok "bun:      running (details hidden)" || ok "bun:      pid ${bp:-?} (plugin bridge)"
   else
     if svc_active; then
       echo "${RED}✗ bun:      missing — messages will NOT flow${RESET}"
@@ -451,8 +487,20 @@ cmd_attach() {
 
 # [L-11] Pass follow as a proper array element, not a quoted-empty-string arg.
 cmd_logs() {
+  local raw=0 follow=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --raw) raw=1 ;;
+      -f|--follow) follow=1 ;;
+      *) die "unknown logs option: $1" ;;
+    esac
+    shift
+  done
+  if is_demo && [ "$raw" != "1" ]; then
+    die "demo mode hides logs to avoid leaking prompts, paths, or tokens; use: claude-tele logs --raw"
+  fi
   local -a args=(--user -u "$SERVICE" -u "$WATCHDOG_SERVICE" -n 100 --no-pager)
-  case "${1:-}" in -f|--follow) args+=(-f) ;; esac
+  [ "$follow" = "1" ] && args+=(-f)
   journalctl "${args[@]}"
 }
 
@@ -564,7 +612,11 @@ cmd_doctor() {
 
   local_check "tmux installed"                                  fatal  command -v tmux
   local_check "bun runs (plugin runtime; catches AVX2 SIGILL)"  fatal  bun --version
-  local_check "claude binary at ${CLAUDE_BIN}"                  fatal  test -x "$CLAUDE_BIN"
+  if is_demo; then
+    local_check "claude binary configured"                         fatal  test -x "$CLAUDE_BIN"
+  else
+    local_check "claude binary at ${CLAUDE_BIN}"                  fatal  test -x "$CLAUDE_BIN"
+  fi
   local_check "bot .env present"                                fatal  test -f "${STATE_DIR}/.env"
   local_check "bot .env permissions 600"                        fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/.env' 2>/dev/null) = '600' ]"
   local_check "access.json present"                             fatal  test -f "${STATE_DIR}/access.json"
@@ -572,8 +624,7 @@ cmd_doctor() {
   local_check "telegram plugin installed"                       fatal  bash -c "compgen -G '${HOME}/.claude/plugins/cache/*/telegram' >/dev/null"
   local_check "service enabled on boot"                         soft   systemctl --user is-enabled --quiet "$SERVICE"
   local_check "watchdog enabled on boot"                        soft   systemctl --user is-enabled --quiet "$WATCHDOG_SERVICE"
-  local_check "lingering enabled (survives logout) · fix: sudo loginctl enable-linger \$(id -un)" \
-                                                                fatal  bash -c "loginctl show-user \$(id -un) 2>/dev/null | grep -q 'Linger=yes'"
+  local_check "lingering enabled (survives logout)"                  fatal  bash -c "loginctl show-user \$(id -un) 2>/dev/null | grep -q 'Linger=yes'"
 
   [ "$issues" -eq 0 ] && ok "all checks passed" || die "${issues} issue(s)"
 }

@@ -9,6 +9,9 @@ BUN_VERSION="${BUN_VERSION:-bun-v1.3.14}"
 INSTALL_DEPS=0
 START_SERVICE=0
 YES=0
+MENU=0
+DEMO_MODE="${CLAUDE_WATCHDOG_DEMO:-0}"
+PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
 
@@ -22,6 +25,9 @@ Options:
   --install-deps              Install missing OS/user deps where supported.
   --token TOKEN               Write Telegram bot token to ~/.claude/channels/telegram/.env.
   --telegram-user-id ID       Allow this Telegram user ID in access.json.
+  --permission-mode MODE       Claude permission mode: default, plan, acceptEdits, auto, dontAsk, bypassPermissions.
+  --demo                      Hide sensitive status/log details for demos.
+  --menu                      Run the interactive setup wizard (same as ./bin/cwd setup).
   --start                     Start the systemd user service after install.
   -y, --yes                   Non-interactive yes for supported install steps.
   -h, --help                  Show this help.
@@ -41,9 +47,12 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --install-deps) INSTALL_DEPS=1 ;;
     --start) START_SERVICE=1 ;;
+    --menu) MENU=1 ;;
+    --demo) DEMO_MODE=1 ;;
     -y|--yes) YES=1 ;;
     --token) shift; BOT_TOKEN="${1:-}" ;;
     --telegram-user-id) shift; TELEGRAM_USER_ID="${1:-}" ;;
+    --permission-mode) shift; PERMISSION_MODE="${1:-}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -62,6 +71,14 @@ confirm() {
   read -r ans
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
+
+validate_permission_mode() {
+  case "$PERMISSION_MODE" in
+    default|plan|acceptEdits|auto|dontAsk|bypassPermissions) return 0 ;;
+    *) die "invalid permission mode: ${PERMISSION_MODE}" ;;
+  esac
+}
+
 
 install_apt_deps() {
   local missing=()
@@ -154,19 +171,37 @@ install_plugin() {
   fi
 }
 
+set_env_key() {
+  local key="$1" value="$2" file="${STATE_DIR}/.env" tmp
+  tmp="$(mktemp)"
+  if [ -f "$file" ]; then
+    grep -v "^${key}=" "$file" > "$tmp" || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  install -m 600 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
 write_env() {
+  validate_permission_mode
   if [ -n "$BOT_TOKEN" ]; then
-    case "$BOT_TOKEN" in
-      *:*) ;;
-      *) die "Telegram bot token should look like '<bot-id>:<secret>'" ;;
-    esac
+    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Telegram bot token should look like '<bot-id>:<secret>'"
     umask 077
-    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN" > "${STATE_DIR}/.env"
+    {
+      printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN"
+      printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
+      printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
+    } > "${STATE_DIR}/.env"
     chmod 600 "${STATE_DIR}/.env"
     log "wrote ${STATE_DIR}/.env"
   elif [ ! -f "${STATE_DIR}/.env" ]; then
     install -m 600 "${ROOT}/config/env.example" "${STATE_DIR}/.env"
+    set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
+    set_env_key "CLAUDE_WATCHDOG_DEMO" "$DEMO_MODE"
     warn "created ${STATE_DIR}/.env — edit TELEGRAM_BOT_TOKEN before starting"
+  else
+    set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
+    set_env_key "CLAUDE_WATCHDOG_DEMO" "$DEMO_MODE"
   fi
 }
 
@@ -198,6 +233,8 @@ PY
   fi
 }
 
+[ "$MENU" = "1" ] && exec "${ROOT}/bin/cwd" setup
+
 if [ "$INSTALL_DEPS" = "1" ]; then
   install_apt_deps
   install_bun
@@ -207,6 +244,7 @@ mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
 
 install -m 700 "${ROOT}/bin/claude-tele" "${HOME}/bin/claude-tele"
+install -m 700 "${ROOT}/bin/cwd" "${HOME}/bin/cwd"
 install -m 700 "${ROOT}/bin/claude-tele-watchdog" "${HOME}/bin/claude-tele-watchdog"
 install -m 700 "${ROOT}/bin/claude-tele-patch-telegram-plugin" "${HOME}/bin/claude-tele-patch-telegram-plugin"
 install -m 700 "${ROOT}/bin/claude-tele-replay-missed" "${HOME}/bin/claude-tele-replay-missed"

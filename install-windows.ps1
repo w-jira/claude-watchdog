@@ -14,6 +14,9 @@ param(
   [switch]$InstallDeps,
   [string]$Token = $env:TELEGRAM_BOT_TOKEN,
   [string]$TelegramUserId = $env:TELEGRAM_USER_ID,
+  [ValidateSet("default", "plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions")]
+  [string]$PermissionMode = $(if ($env:CLAUDE_PERMISSION_MODE) { $env:CLAUDE_PERMISSION_MODE } else { "bypassPermissions" }),
+  [switch]$Demo,
   [switch]$Start,
   [switch]$Yes
 )
@@ -34,6 +37,17 @@ function Confirm-Step($Prompt) {
   if ($Yes) { return $true }
   $answer = Read-Host "$Prompt [y/N]"
   return $answer -match '^(y|yes)$'
+}
+function Set-EnvKey($Path, $Name, $Value) {
+  $lines = @()
+  if (Test-Path $Path) { $lines = Get-Content $Path | Where-Object { $_ -notlike "$Name=*" } }
+  $lines += "$Name=$Value"
+  Set-Content -Path $Path -Value $lines -Encoding UTF8
+}
+function Protect-PrivateFile($Path) {
+  if (Test-Path $Path) {
+    icacls $Path /inheritance:r /grant:r "$($env:USERNAME):(R,W)" *> $null
+  }
 }
 
 function Install-Dependencies {
@@ -77,13 +91,22 @@ function Install-TelegramPlugin {
 
 function Write-Config {
   New-Item -ItemType Directory -Force -Path $StateDir, $WorkDir | Out-Null
+  $envPath = Join-Path $StateDir ".env"
   if ($Token) {
-    if ($Token -notmatch '.+:.+') { Die "Telegram bot token should look like '<bot-id>:<secret>'" }
-    Set-Content -Path (Join-Path $StateDir ".env") -Value "TELEGRAM_BOT_TOKEN=$Token" -Encoding UTF8
+    if ($Token -notmatch '^[0-9]+:[A-Za-z0-9_-]+$') { Die "Telegram bot token should look like '<bot-id>:<secret>'" }
+    Set-Content -Path $envPath -Value @("TELEGRAM_BOT_TOKEN=$Token", "CLAUDE_PERMISSION_MODE=$PermissionMode", "CLAUDE_WATCHDOG_DEMO=$([int][bool]$Demo)") -Encoding UTF8
+    Protect-PrivateFile $envPath
     Log "wrote $StateDir\.env"
   } elseif (-not (Test-Path (Join-Path $StateDir ".env"))) {
-    Copy-Item (Join-Path $Root "config\env.example") (Join-Path $StateDir ".env")
+    Copy-Item (Join-Path $Root "config\env.example") $envPath
+    Set-EnvKey $envPath "CLAUDE_PERMISSION_MODE" $PermissionMode
+    Set-EnvKey $envPath "CLAUDE_WATCHDOG_DEMO" $([int][bool]$Demo)
+    Protect-PrivateFile $envPath
     Warn "created $StateDir\.env — edit TELEGRAM_BOT_TOKEN before starting"
+  } else {
+    Set-EnvKey $envPath "CLAUDE_PERMISSION_MODE" $PermissionMode
+    Set-EnvKey $envPath "CLAUDE_WATCHDOG_DEMO" $([int][bool]$Demo)
+    Protect-PrivateFile $envPath
   }
 
   if ($TelegramUserId) {
@@ -98,10 +121,14 @@ function Write-Config {
       textChunkLimit = 4096
       chunkMode = "newline"
     }
-    $payload | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $StateDir "access.json") -Encoding UTF8
+    $accessPath = Join-Path $StateDir "access.json"
+    $payload | ConvertTo-Json -Depth 5 | Set-Content -Path $accessPath -Encoding UTF8
+    Protect-PrivateFile $accessPath
     Log "wrote $StateDir\access.json"
   } elseif (-not (Test-Path (Join-Path $StateDir "access.json"))) {
-    Copy-Item (Join-Path $Root "config\access.example.json") (Join-Path $StateDir "access.json")
+    $accessPath = Join-Path $StateDir "access.json"
+    Copy-Item (Join-Path $Root "config\access.example.json") $accessPath
+    Protect-PrivateFile $accessPath
     Warn "created $StateDir\access.json — add your Telegram user ID before starting"
   }
 }

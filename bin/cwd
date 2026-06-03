@@ -1,0 +1,142 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_DIR="${HOME}/.claude/channels/telegram"
+ENV_FILE="${STATE_DIR}/.env"
+ACCESS_FILE="${STATE_DIR}/access.json"
+
+if [ -t 1 ]; then
+  BOLD=$'\e[1m'; BLUE=$'\e[34m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RESET=$'\e[0m'
+else
+  BOLD=""; BLUE=""; GREEN=""; YELLOW=""; RESET=""
+fi
+
+log() { printf '%s\n' "$*"; }
+ok() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%swarn:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+confirm() { printf '%s [y/N] ' "$1"; read -r ans; case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+
+usage() {
+  cat <<'EOF'
+Usage: cwd <command>
+
+Commands:
+  setup      Interactive secure setup wizard.
+  status     Show bot status.
+  start      Start the bot service.
+  stop       Stop the bot service.
+  restart    Restart the bot service.
+  doctor     Run setup diagnostics.
+  logs       Show logs (blocked in demo mode unless using claude-tele logs --raw).
+  help       Show this help.
+EOF
+}
+
+write_env() {
+  local token="$1" mode="$2" demo="$3"
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  {
+    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token"
+    printf 'CLAUDE_PERMISSION_MODE=%s\n' "$mode"
+    printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$demo"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+write_access() {
+  local user_id="$1"
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  {
+    printf '{\n'
+    printf '  "dmPolicy": "allowlist",\n'
+    printf '  "allowFrom": ["%s"],\n' "$user_id"
+    printf '  "groups": {},\n'
+    printf '  "pending": {},\n'
+    printf '  "ackReaction": "👀",\n'
+    printf '  "replyToMode": "first",\n'
+    printf '  "textChunkLimit": 4096,\n'
+    printf '  "chunkMode": "newline"\n'
+    printf '}\n'
+  } > "$ACCESS_FILE"
+  chmod 600 "$ACCESS_FILE"
+}
+
+choose_permission() {
+  log "" >&2
+  log "${BOLD}Claude permission level${RESET}" >&2
+  log "  1) default      Ask before tools (recommended for demos)" >&2
+  log "  2) plan         Read/plan first" >&2
+  log "  3) acceptEdits  Auto-accept file edits" >&2
+  log "  4) auto         Claude decides when to ask" >&2
+  log "  5) dontAsk      Less prompting" >&2
+  log "  6) bypass       No permission prompts; sandbox only" >&2
+  printf 'Choose [1-6] (default 1): ' >&2
+  read -r choice
+  case "${choice:-1}" in
+    1) printf 'default\n' ;;
+    2) printf 'plan\n' ;;
+    3) printf 'acceptEdits\n' ;;
+    4) printf 'auto\n' ;;
+    5) printf 'dontAsk\n' ;;
+    6) printf 'bypassPermissions\n' ;;
+    *) die "invalid permission choice: ${choice}" ;;
+  esac
+}
+
+cmd_setup() {
+  local installer=""
+  if [ -f "${ROOT}/config/env.example" ] && [ -f "${ROOT}/config/access.example.json" ]; then
+    case "$(uname -s)" in
+      Darwin) [ -f "${ROOT}/install-macos.sh" ] && installer="${ROOT}/install-macos.sh" ;;
+      Linux) [ -f "${ROOT}/install.sh" ] && installer="${ROOT}/install.sh" ;;
+      *) die "setup supports Linux/macOS; use install-windows.ps1 on Windows" ;;
+    esac
+  fi
+  log "${BLUE}${BOLD}claude-watchdog setup${RESET}"
+  log "This wizard keeps secrets out of shell history by reading the bot token hidden."
+  log ""
+
+  printf 'Telegram bot token from BotFather: '
+  read -rs token
+  printf '\n'
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Telegram bot token should look like '<bot-id>:<secret>'"
+
+  printf 'Your Telegram user ID: '
+  read -r user_id
+  [[ "$user_id" =~ ^[0-9]+$ ]] || die "Telegram user ID must be numeric"
+
+  mode="$(choose_permission)"
+  demo=0
+  confirm "Enable demo mode to hide sensitive status/log details?" && demo=1
+  install_deps=0
+  confirm "Install missing supported dependencies?" && install_deps=1
+  start=0
+  confirm "Start after setup?" && start=1
+
+  write_env "$token" "$mode" "$demo"
+  write_access "$user_id"
+  unset token
+  ok "wrote secure config files (${STATE_DIR}; token not printed)"
+
+  if [ -n "$installer" ]; then
+    args=(--yes --permission-mode "$mode")
+    [ "$demo" = "1" ] && args+=(--demo)
+    [ "$install_deps" = "1" ] && args+=(--install-deps)
+    [ "$start" = "1" ] && args+=(--start)
+    "$installer" "${args[@]}"
+  else
+    warn "installer assets not found; updated config only"
+    warn "for first-time install, run ./bin/cwd setup from the cloned repo"
+  fi
+}
+
+case "${1:-help}" in
+  setup) cmd_setup ;;
+  status|start|stop|restart|doctor|logs) command -v claude-tele >/dev/null 2>&1 || die "claude-tele not installed yet; run: cwd setup"; claude-tele "$@" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command: $1" ;;
+esac
