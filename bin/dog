@@ -225,7 +225,7 @@ EOF
   demo=0
   confirm "Enable demo mode to hide sensitive status/log details?" && demo=1
   install_deps=0
-  confirm "Install missing supported dependencies?" && install_deps=1
+  confirm "Install missing supported dependencies, including Claude Code when npm is available?" && install_deps=1
   start=0
   confirm "Start after setup?" && start=1
 

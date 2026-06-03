@@ -11,6 +11,7 @@ BUN_VERSION="${BUN_VERSION:-bun-v1.3.14}"
 INSTALL_DEPS=0
 START_SERVICE=0
 YES=0
+CLAUDE_INSTALLED_THIS_RUN=0
 MENU=0
 DEMO_MODE="${CLAUDE_WATCHDOG_DEMO:-0}"
 PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
@@ -39,7 +40,8 @@ Agent-friendly example:
     ./install.sh --install-deps --start --yes
 
 Notes:
-  - Claude Code CLI must be installed and authenticated before the bot can run.
+  - If Claude Code is missing and npm is available, --install-deps installs it
+    into ~/.npm-global/bin and symlinks it into ~/.local/bin.
   - If bun is missing and --install-deps is set, this installs a pinned Bun release
     into ~/.bun/bin and symlinks it into ~/bin.
 EOF
@@ -136,6 +138,27 @@ install_bun() {
   ln -sfn "${HOME}/.bun/bin/bun" "${HOME}/bin/bun"
 }
 
+install_claude_code() {
+  if has claude || [ -x "${HOME}/.local/bin/claude" ]; then
+    return 0
+  fi
+  [ "$INSTALL_DEPS" = "1" ] || return 0
+  if ! has npm; then
+    warn "npm is missing; install a current Node.js LTS/npm, then re-run dog setup to install Claude Code"
+    return 0
+  fi
+
+  install -d -m 755 "${HOME}/.npm-global/bin" "${HOME}/.local/bin"
+  export PATH="${HOME}/.npm-global/bin:${PATH}"
+  log "installing Claude Code CLI with npm into ~/.npm-global"
+  npm install -g --prefix "${HOME}/.npm-global" @anthropic-ai/claude-code
+  if [ -x "${HOME}/.npm-global/bin/claude" ]; then
+    ln -sfn "${HOME}/.npm-global/bin/claude" "${HOME}/.local/bin/claude"
+    log "linked ${HOME}/.local/bin/claude -> ${HOME}/.npm-global/bin/claude"
+    CLAUDE_INSTALLED_THIS_RUN=1
+  fi
+}
+
 ensure_claude_symlink() {
   # claude-tele expects ${HOME}/.local/bin/claude (also on the service's PATH).
   # Many installs place claude at /usr/local/bin or behind a version manager,
@@ -169,7 +192,7 @@ install_plugin() {
   if "$claude_bin" plugin install telegram@claude-plugins-official >/dev/null 2>&1 || plugin_installed; then
     log "installed plugin telegram@claude-plugins-official"
   else
-    warn "could not auto-install the telegram plugin — run: claude plugin install telegram@claude-plugins-official"
+    warn "could not auto-install the telegram plugin — run: claude to authenticate, then run: claude plugin install telegram@claude-plugins-official"
   fi
 }
 
@@ -274,6 +297,7 @@ PY
 if [ "$INSTALL_DEPS" = "1" ]; then
   install_apt_deps
   install_bun
+  install_claude_code
 fi
 
 mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}"
@@ -304,12 +328,17 @@ for cmd in claude tmux python3 systemctl bun; do
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   warn "missing commands: ${missing[*]}"
-  warn "run again with --install-deps for supported deps; install/authenticate Claude Code separately"
+  warn "run again with --install-deps for supported deps; authenticate Claude Code separately after install"
+fi
+
+if [ "$START_SERVICE" = "1" ] && [ "$CLAUDE_INSTALLED_THIS_RUN" = "1" ]; then
+  warn "Claude Code was installed during this setup; run claude to authenticate, then run: dog start"
+  START_SERVICE=0
 fi
 
 if [ "$START_SERVICE" = "1" ]; then
   has claude || [ -x "${HOME}/.local/bin/claude" ] || die "claude CLI is missing; install and authenticate it before --start"
-  plugin_installed || die "telegram plugin is not installed; run: claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install telegram@claude-plugins-official"
+  plugin_installed || die "telegram plugin is not installed; run claude to authenticate, then run: claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install telegram@claude-plugins-official"
   [ -s "${STATE_DIR}/.env" ] || die "missing ${STATE_DIR}/.env"
   [ -s "${STATE_DIR}/access.json" ] || die "missing ${STATE_DIR}/access.json"
   "${HOME}/bin/claude-tele" start

@@ -13,6 +13,7 @@ PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
 START_SERVICE=0
 INSTALL_DEPS=0
 YES=0
+CLAUDE_INSTALLED_THIS_RUN=0
 
 usage() {
   cat <<'EOF'
@@ -35,7 +36,8 @@ Example:
     ./install-macos.sh --install-deps --start --yes
 
 Notes:
-  - Claude Code CLI must be installed and authenticated first.
+  - If Claude Code is missing and npm is available, --install-deps installs it
+    into ~/.npm-global/bin and symlinks it into ~/.local/bin.
   - Homebrew is used only when --install-deps is set.
 EOF
 }
@@ -74,7 +76,7 @@ set_env_key() {
 
 install_deps() {
   local missing=()
-  for cmd in tmux python3 curl unzip git bun; do
+  for cmd in tmux python3 curl unzip git bun npm; do
     has "$cmd" || missing+=("$cmd")
   done
   [ "${#missing[@]}" -eq 0 ] && return 0
@@ -84,6 +86,7 @@ install_deps() {
   for pkg in "${missing[@]}"; do
     case "$pkg" in
       python3) brew install python ;;
+      npm) brew install node ;;
       *) brew install "$pkg" ;;
     esac
   done
@@ -94,6 +97,27 @@ resolve_claude() {
     echo "${HOME}/.local/bin/claude"
   else
     command -v claude 2>/dev/null || true
+  fi
+}
+
+install_claude_code() {
+  if [ -n "$(resolve_claude)" ]; then
+    return 0
+  fi
+  [ "$INSTALL_DEPS" = "1" ] || return 0
+  if ! has npm; then
+    warn "npm is missing; install a current Node.js LTS/npm, then re-run dog setup to install Claude Code"
+    return 0
+  fi
+
+  install -d -m 755 "${HOME}/.npm-global/bin" "${HOME}/.local/bin"
+  export PATH="${HOME}/.npm-global/bin:${PATH}"
+  log "installing Claude Code CLI with npm into ~/.npm-global"
+  npm install -g --prefix "${HOME}/.npm-global" @anthropic-ai/claude-code
+  if [ -x "${HOME}/.npm-global/bin/claude" ]; then
+    ln -sfn "${HOME}/.npm-global/bin/claude" "${HOME}/.local/bin/claude"
+    log "linked ${HOME}/.local/bin/claude -> ${HOME}/.npm-global/bin/claude"
+    CLAUDE_INSTALLED_THIS_RUN=1
   fi
 }
 
@@ -117,7 +141,7 @@ install_plugin() {
   if "$claude_bin" plugin install telegram@claude-plugins-official >/dev/null 2>&1 || plugin_installed; then
     log "installed plugin telegram@claude-plugins-official"
   else
-    warn "could not auto-install telegram plugin — run: claude plugin install telegram@claude-plugins-official"
+    warn "could not auto-install telegram plugin — run: claude to authenticate, then run: claude plugin install telegram@claude-plugins-official"
   fi
 }
 
@@ -198,6 +222,7 @@ PY
 }
 
 install_deps
+install_claude_code
 mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
 install -m 700 "${ROOT}/bin/claude-tele-macos" "${HOME}/bin/claude-tele"
@@ -218,12 +243,17 @@ for cmd in claude tmux python3 bun; do
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   warn "missing commands: ${missing[*]}"
-  warn "run again with --install-deps for supported deps; install/authenticate Claude Code separately"
+  warn "run again with --install-deps for supported deps; authenticate Claude Code separately after install"
+fi
+
+if [ "$START_SERVICE" = "1" ] && [ "$CLAUDE_INSTALLED_THIS_RUN" = "1" ]; then
+  warn "Claude Code was installed during this setup; run claude to authenticate, then run: dog start"
+  START_SERVICE=0
 fi
 
 if [ "$START_SERVICE" = "1" ]; then
   [ -n "$(resolve_claude)" ] || die "claude CLI is missing; install and authenticate it before --start"
-  plugin_installed || die "telegram plugin is not installed; run: claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install telegram@claude-plugins-official"
+  plugin_installed || die "telegram plugin is not installed; run claude to authenticate, then run: claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install telegram@claude-plugins-official"
   "${HOME}/bin/claude-tele" start
 fi
 

@@ -33,6 +33,12 @@ This repo handles the boring production bits:
 
 ## Recommended setup
 
+For the smoothest always-on setup, run this on a small Linux VM/VPS such as Ubuntu on AWS Lightsail, EC2, DigitalOcean, Hetzner, or similar. Cloud providers often offer introductory credits or free-tier trials for eligible accounts; terms change, so verify the current offer before relying on it.
+
+If you are new to servers, start with the beginner walkthrough:
+
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+
 Use the CLI wizard. It keeps the bot token out of shell history and command arguments.
 
 ```bash
@@ -47,7 +53,7 @@ The wizard asks for:
 - your Telegram user ID, which it can auto-detect by asking you to send a one-time test message to the bot
 - Claude permission mode
 - demo mode on/off
-- whether to install missing dependencies
+- whether to install missing dependencies, including Claude Code when npm is available
 - whether to start the bot immediately
 
 By default, `dog setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
@@ -85,7 +91,7 @@ claude-tele attach
 
 Before the bot can run, you need:
 
-- Claude Code CLI installed and authenticated
+- Claude Code CLI installed and authenticated; `dog setup` can install the CLI when npm is available, but you still need to complete Claude Code login yourself
 - a Telegram bot token from BotFather
 - your Telegram user ID; `dog setup` can detect it automatically from a one-time test message
 
