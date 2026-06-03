@@ -16,16 +16,25 @@ One-stop installer and watchdog for running Claude Code as an always-on Telegram
 - Replays journaled Telegram texts that are absent from Claude transcripts after restart.
 - Optional least-privilege MCP helper can request only `/compact`.
 
+## Platform support
+
+- **Linux:** full support via `systemd --user` + `tmux` + watchdog auto-heal/auto-compact.
+- **macOS:** beta support via LaunchAgent + `tmux`. Runs the Telegram bot at login and supports `start`, `stop`, `restart`, `status`, `attach`, `logs`, `heal`, and `doctor`. Auto-compact watchdog parity is not implemented yet.
+- **Windows:** beta native support via PowerShell + Scheduled Task. Runs/restarts Claude at logon and supports `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. First-run Claude trust/permissions prompts may need to be accepted once interactively. Native Windows beta intentionally does not use `--continue` yet to avoid resuming an unrelated interactive Windows transcript; WSL2 remains the recommended Windows path for Linux-equivalent behavior, including full watchdog/tmux parity.
+
 ## Requirements
 
 Required before the bot can run:
 
-- Linux with `systemd --user`
 - Claude Code CLI installed and authenticated
 - Telegram bot token from BotFather
 - Your numeric Telegram user ID for the allowlist
 
-The installer can handle these on Debian/Ubuntu when run with `--install-deps`:
+Linux full mode also requires:
+
+- Linux with `systemd --user`
+
+The Linux installer can handle these on Debian/Ubuntu when run with `--install-deps`:
 
 - `tmux`
 - `python3`
@@ -41,6 +50,8 @@ Optional:
 
 ## Fast path
 
+### Linux
+
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
@@ -49,36 +60,106 @@ TELEGRAM_USER_ID='123456789' \
   ./install.sh --install-deps --start --yes
 ```
 
+### macOS
+
+```bash
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
+TELEGRAM_USER_ID='123456789' \
+  ./install-macos.sh --install-deps --start --yes
+```
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+$env:TELEGRAM_BOT_TOKEN = "replace-with-botfather-token"
+$env:TELEGRAM_USER_ID = "123456789"
+.\install-windows.ps1 -InstallDeps -Start -Yes
+```
+
+On Windows, if Claude exits or hangs on a first-run trust/permissions prompt, run this once in an interactive terminal from `%USERPROFILE%\.claude\channels\telegram\workdir`, accept the prompts, then restart the task:
+
+```powershell
+claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" restart
+```
+
 Then check:
+
+Linux/macOS:
 
 ```bash
 claude-tele status
 claude-tele logs
 ```
 
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" status
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" logs
+```
+
 ## Agent-friendly setup
 
 If an AI agent is helping you install this, give it only these values:
 
+- Target OS: Linux, macOS, Windows native, or Windows WSL2
 - Telegram bot token
 - Telegram user ID
-- whether it may run `sudo apt-get install` for missing OS packages
+- whether it may install missing dependencies (`sudo apt-get` on Debian/Ubuntu, Homebrew on macOS, winget on Windows)
 
-Recommended agent command:
+Recommended Linux agent command:
 
 ```bash
 TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
   ./install.sh --install-deps --start --yes
 ```
 
-The installer is idempotent: re-running it updates scripts/services and preserves existing config unless token/user ID are explicitly provided.
+Recommended macOS agent command:
+
+```bash
+TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
+  ./install-macos.sh --install-deps --start --yes
+```
+
+Recommended Windows PowerShell agent command:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "<bot-token>"
+$env:TELEGRAM_USER_ID = "<telegram-user-id>"
+.\install-windows.ps1 -InstallDeps -Start -Yes
+```
+
+The installers are idempotent: re-running them updates scripts/services and preserves existing config unless token/user ID are explicitly provided.
 
 ## Manual setup
+
+Linux:
 
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
 ./install.sh
+```
+
+macOS:
+
+```bash
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+./install-macos.sh
+```
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+.\install-windows.ps1
 ```
 
 Then edit:
@@ -119,19 +200,35 @@ claude-tele status
 
 ## Installer options
 
+Linux:
+
 ```bash
 ./install.sh --help
 ```
 
-Options:
+macOS:
 
-- `--install-deps`: install missing supported dependencies.
-- `--token TOKEN`: write Telegram bot token.
-- `--telegram-user-id ID`: write allowlist config.
-- `--start`: start the bot after install.
-- `--yes`: non-interactive yes for supported install steps.
+```bash
+./install-macos.sh --help
+```
+
+Windows:
+
+```powershell
+Get-Help .\install-windows.ps1
+```
+
+Common options:
+
+- `--install-deps` / `-InstallDeps`: install missing supported dependencies.
+- `--token TOKEN` / `-Token TOKEN`: write Telegram bot token.
+- `--telegram-user-id ID` / `-TelegramUserId ID`: write allowlist config.
+- `--start` / `-Start`: start the bot after install.
+- `--yes` / `-Yes`: non-interactive yes for supported install steps.
 
 ## Commands
+
+Linux full mode:
 
 ```bash
 claude-tele start
@@ -144,6 +241,30 @@ claude-tele heal
 claude-tele compact [--json] [--force]
 claude-tele replay-missed [--dry-run]
 claude-tele doctor
+```
+
+macOS beta mode:
+
+```bash
+claude-tele start
+claude-tele stop
+claude-tele restart
+claude-tele status
+claude-tele attach
+claude-tele logs [-f]
+claude-tele heal
+claude-tele doctor
+```
+
+Windows beta mode:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" start
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" stop
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" restart
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" status
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" logs
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\claude-watchdog\claude-watchdog-windows.ps1" doctor
 ```
 
 ## No GitHub login on the VM
