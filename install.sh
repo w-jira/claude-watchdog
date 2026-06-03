@@ -76,7 +76,10 @@ install_apt_deps() {
 }
 
 install_bun() {
-  if has bun; then
+  # Verify bun actually *runs*, not just that it's on PATH. A bun built for a
+  # CPU feature this host lacks (e.g. AVX2) is present but crashes with SIGILL,
+  # so `has bun` would wrongly skip the (re)install. `bun --version` catches it.
+  if bun --version >/dev/null 2>&1; then
     return 0
   fi
   [ "$INSTALL_DEPS" = "1" ] || return 0
@@ -85,7 +88,17 @@ install_bun() {
 
   local arch asset tmp zipdir
   case "$(uname -m)" in
-    x86_64|amd64) arch="x64" ;;
+    x86_64|amd64)
+      # The default bun x64 build requires AVX2. VirtualBox/QEMU guests, older
+      # CPUs, and some cloud instances lack it — there, bun SIGILLs on every
+      # invocation and the Telegram bridge silently never starts. Fall back to
+      # the baseline build (no AVX2 required) when AVX2 is absent.
+      if grep -qm1 avx2 /proc/cpuinfo 2>/dev/null; then
+        arch="x64"
+      else
+        arch="x64-baseline"
+        log "CPU has no AVX2 — using bun baseline build (bun-linux-x64-baseline)"
+      fi ;;
     aarch64|arm64) arch="aarch64" ;;
     *) die "unsupported architecture for bundled bun install: $(uname -m)" ;;
   esac

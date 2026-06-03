@@ -234,20 +234,43 @@ cmd_exec_start() {
   printf -v cmd_str '%q ' "${argv[@]}"
   tmux new-session -d -s "$SESSION" -c "$WORKDIR" -- "$cmd_str"
 
-  # [M-8] Poll the pane for the trust-prompt text rather than magic-sleeping.
-  # The prompt shows "Do you trust the files in this folder?" on first run
-  # only. If it appears, Enter accepts the default; if it doesn't within 30s,
-  # assume no prompt (subsequent run) and continue.
-  local i
-  for i in $(seq 1 30); do
+  # [M-8] Poll the pane for first-run prompts rather than magic-sleeping.
+  # There can be TWO sequential prompts on a fresh session, and we must not
+  # break after the first — the bypass-permissions one follows the trust one:
+  #
+  #   1. Folder-trust. Wording has changed across Claude versions
+  #      ("trust the files in this folder" → "Is this a project you created or
+  #      one you trust?"). Default highlighted option is "trust", so Enter
+  #      accepts.
+  #   2. Bypass-permissions warning (only with --dangerously-skip-permissions).
+  #      Its default is "No, exit" — pressing Enter would KILL the session.
+  #      We must explicitly pick option 2 ("Yes, I accept").
+  #
+  # Match all known wordings so a Claude UI tweak doesn't silently hang startup.
+  local i trust_done=0 bypass_done=0
+  for i in $(seq 1 60); do
     local pane
     pane=$(tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null || true)
-    if printf '%s\n' "$pane" | grep -q "trust the files"; then
-      tmux send-keys -t "$SESSION" -- Enter
-      echo "trust prompt accepted"
-      break
+    if [ "$trust_done" = 0 ] && \
+       printf '%s\n' "$pane" | grep -qE "trust the files|trust this folder|Is this a project you created"; then
+      tmux send-keys -t "$SESSION" -- Enter   # default option = trust this folder
+      echo "folder-trust prompt accepted"
+      trust_done=1
+      sleep 1
+      continue
     fi
-    # Also break early if the prompt "❯" has appeared (no trust dialog needed).
+    if [ "$bypass_done" = 0 ] && \
+       printf '%s\n' "$pane" | grep -q "Bypass Permissions mode"; then
+      # Default is "No, exit"; select option 2 "Yes, I accept", then confirm.
+      tmux send-keys -t "$SESSION" -- "2"
+      sleep 1
+      tmux send-keys -t "$SESSION" -- Enter
+      echo "bypass-permissions prompt accepted"
+      bypass_done=1
+      sleep 1
+      continue
+    fi
+    # Break once the input prompt "❯" appears (all prompts cleared).
     if printf '%s\n' "$pane" | tail -6 | grep -qE '^❯[[:space:]]*$'; then
       break
     fi
@@ -530,7 +553,7 @@ cmd_doctor() {
   }
 
   local_check "tmux installed"                                  fatal  command -v tmux
-  local_check "bun installed (plugin runtime)"                  fatal  command -v bun
+  local_check "bun runs (plugin runtime; catches AVX2 SIGILL)"  fatal  bun --version
   local_check "claude binary at ${CLAUDE_BIN}"                  fatal  test -x "$CLAUDE_BIN"
   local_check "bot .env present"                                fatal  test -f "${STATE_DIR}/.env"
   local_check "bot .env permissions 600"                        fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/.env' 2>/dev/null) = '600' ]"
