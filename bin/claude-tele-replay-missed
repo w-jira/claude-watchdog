@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Replay Telegram messages journaled by claude-tele but absent from Claude transcripts.
+
+The Telegram Bot API cannot retrieve confirmed history. The plugin patch journals
+allowed inbound messages before handing them to Claude. If the MCP notification
+fails or Claude restarts before consuming it, this tool can inject a synthetic
+<channel> block into the live tmux session so Claude knows what it missed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+SESSION = os.environ.get("CLAUDE_TELE_SESSION", "telegram-claude")
+STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR", Path.home() / ".claude" / "channels" / "telegram"))
+WORKDIR = Path(os.environ.get("CLAUDE_TELE_WORKDIR", STATE_DIR / "workdir"))
+JOURNAL_FILE = Path(os.environ.get("CLAUDE_TELE_INBOUND_JOURNAL", STATE_DIR / "inbound-journal.jsonl"))
+ACK_FILE = Path(os.environ.get("CLAUDE_TELE_REPLAY_ACK", STATE_DIR / "replayed-inbound.jsonl"))
+MIN_AGE_SECONDS = int(os.environ.get("CLAUDE_TELE_REPLAY_MIN_AGE", "30"))
+MAX_REPLAY = int(os.environ.get("CLAUDE_TELE_REPLAY_MAX", "20"))
+
+
+def project_slug(path: Path) -> str:
+  return str(path).replace("/", "-").replace(".", "-")
+
+
+def transcript_dir() -> Path:
+  return Path.home() / ".claude" / "projects" / project_slug(WORKDIR)
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+  if not path.exists():
+    return []
+  rows: list[dict[str, Any]] = []
+  with path.open("r", encoding="utf-8", errors="replace") as f:
+    for line in f:
+      line = line.strip()
+      if not line:
+        continue
+      try:
+        parsed = json.loads(line)
+      except json.JSONDecodeError:
+        continue
+      if isinstance(parsed, dict):
+        rows.append(parsed)
+  return rows
+
+
+def message_key(row: dict[str, Any]) -> str | None:
+  meta = row.get("meta")
+  if not isinstance(meta, dict):
+    return None
+  chat_id = meta.get("chat_id")
+  message_id = meta.get("message_id")
+  if chat_id is None or message_id is None:
+    return None
+  return f"{chat_id}:{message_id}"
+
+
+def delivered_keys_from_transcripts() -> set[str]:
+  keys: set[str] = set()
+  tdir = transcript_dir()
+  if not tdir.exists():
+    return keys
+  # Read newest first; all top-level jsonl files are expected to be Telegram workdir transcripts.
+  for path in sorted(tdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+    try:
+      text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+      continue
+    for chat_id, message_id in re.findall(r'<channel\b[^>]*\bchat_id="([^"]+)"[^>]*\bmessage_id="([^"]+)"', text):
+      keys.add(f"{html.unescape(chat_id)}:{html.unescape(message_id)}")
+  return keys
+
+
+def replayed_keys() -> set[str]:
+  return {key for row in load_jsonl(ACK_FILE) if (key := message_key(row))}
+
+
+def pending_rows() -> list[dict[str, Any]]:
+  now = int(time.time())
+  delivered = delivered_keys_from_transcripts()
+  acked = replayed_keys()
+  pending: list[dict[str, Any]] = []
+
+  for row in load_jsonl(JOURNAL_FILE):
+    key = message_key(row)
+    if not key or key in delivered or key in acked:
+      continue
+    journaled_at = row.get("journaled_at")
+    try:
+      age = now - int(journaled_at)
+    except (TypeError, ValueError):
+      age = MIN_AGE_SECONDS
+    if age < MIN_AGE_SECONDS:
+      continue
+    pending.append(row)
+
+  pending.sort(key=lambda r: (str(r.get("meta", {}).get("ts", "")), int(r.get("meta", {}).get("message_id", 0))))
+  return pending[:MAX_REPLAY]
+
+
+def channel_block(row: dict[str, Any]) -> str:
+  meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+  content = str(row.get("content", ""))
+  attrs: list[tuple[str, str]] = [("source", "plugin:telegram:telegram"), ("replayed", "claude-tele")]
+  for key in [
+    "chat_id",
+    "message_id",
+    "user",
+    "user_id",
+    "ts",
+    "image_path",
+    "attachment_kind",
+    "attachment_file_id",
+    "attachment_size",
+    "attachment_mime",
+    "attachment_name",
+  ]:
+    value = meta.get(key)
+    if value is not None:
+      attrs.append((key, str(value)))
+  attr_text = " ".join(f'{k}="{html.escape(v, quote=True)}"' for k, v in attrs)
+  body = content.replace("</channel>", "&lt;/channel&gt;")
+  return f"<channel {attr_text}>\n{body}\n</channel>"
+
+
+def write_ack(rows: list[dict[str, Any]]) -> None:
+  if not rows:
+    return
+  ACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+  with ACK_FILE.open("a", encoding="utf-8") as f:
+    for row in rows:
+      f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+  ACK_FILE.chmod(0o600)
+
+
+def tmux_has_session() -> bool:
+  return subprocess.run(["tmux", "has-session", "-t", SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def inject(prompt: str) -> None:
+  if not tmux_has_session():
+    raise RuntimeError(f"tmux session not found: {SESSION}")
+  with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+    tmp.write(prompt)
+    tmp_path = tmp.name
+  try:
+    subprocess.run(["tmux", "load-buffer", "-t", SESSION, tmp_path], check=True)
+    subprocess.run(["tmux", "paste-buffer", "-t", SESSION], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", SESSION, "Enter"], check=True)
+  finally:
+    try:
+      os.unlink(tmp_path)
+    except OSError:
+      pass
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--dry-run", action="store_true", help="print pending replay prompt instead of injecting")
+  parser.add_argument("--ack", action="store_true", help="mark pending rows as replayed even in dry-run mode")
+  args = parser.parse_args()
+
+  rows = pending_rows()
+  if not rows:
+    print("no missed Telegram messages to replay")
+    return 0
+
+  blocks = "\n\n".join(channel_block(row) for row in rows)
+  prompt = (
+    "Replay missed Telegram messages. These allowed inbound messages were journaled by the "
+    "Telegram bridge but are absent from this Claude session transcript. Treat each block as "
+    "a normal Telegram channel message, continue from the latest one, and avoid duplicate "
+    "responses if you already handled any of them.\n\n"
+    f"{blocks}"
+  )
+
+  if args.dry_run:
+    print(prompt)
+  else:
+    inject(prompt)
+    print(f"replayed {len(rows)} missed Telegram message(s) into tmux session {SESSION}")
+
+  if not args.dry_run or args.ack:
+    write_ack(rows)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Idempotently patch Claude's Telegram plugin with claude-tele reliability fixes.
+
+The official plugin lives in Claude's plugin cache, so updates can replace it.
+Run this before starting the always-on telegram-claude session.
+"""
+
+from pathlib import Path
+import os
+import sys
+
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+PLUGIN_ROOT = HOME / ".claude" / "plugins" / "cache" / "claude-plugins-official" / "telegram"
+OUTBOUND_MARKER = "// claude-tele patch: outbound Bot API queue + Telegram 429 retry"
+INBOUND_MARKER = "// claude-tele patch: inbound journal + health heartbeat"
+
+OUTBOUND_PATCH = r'''
+// claude-tele patch: outbound Bot API queue + Telegram 429 retry
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Aborted delay'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    const abort = () => {
+      clearTimeout(timer)
+      reject(new Error('Aborted delay'))
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+// Serialize outbound Bot API calls and honor Telegram flood control.
+// Do NOT queue getUpdates: it is long-polling and grammY already manages it.
+let outboundApiTail = Promise.resolve()
+bot.api.config.use(async (prev, method, payload, signal) => {
+  if (method === 'getUpdates') return prev(method, payload, signal)
+
+  const run = outboundApiTail.then(async () => {
+    // Telegram commonly enforces ~1 message/sec per chat. This bridge is
+    // single-user in practice, so a conservative global queue is reliable and
+    // simpler than per-chat queues.
+    await sleepMs(1050, signal)
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await prev(method, payload, signal)
+      } catch (err) {
+        if (err instanceof GrammyError && err.error_code === 429) {
+          const retryAfter = err.parameters.retry_after ?? 1
+          process.stderr.write(
+            `telegram channel: ${method} rate-limited, retrying after ${retryAfter}s\n`,
+          )
+          await sleepMs(retryAfter * 1000 + 250, signal)
+          continue
+        }
+
+        if (err instanceof GrammyError && err.error_code >= 500 && attempt <= 3) {
+          const delay = Math.min(1000 * 2 ** (attempt - 1), 5000)
+          process.stderr.write(
+            `telegram channel: ${method} transient ${err.error_code}, retrying in ${delay / 1000}s\n`,
+          )
+          await sleepMs(delay, signal)
+          continue
+        }
+
+        throw err
+      }
+    }
+  })
+
+  outboundApiTail = run.then(() => undefined, () => undefined)
+  return run
+})
+'''
+
+INBOUND_PATCH = r'''
+// claude-tele patch: inbound journal + health heartbeat
+const HEALTH_FILE = join(STATE_DIR, 'plugin-health.json')
+const INBOUND_JOURNAL_FILE = join(STATE_DIR, 'inbound-journal.jsonl')
+
+type ClaudeTeleInboundMeta = Record<string, string>
+
+function writeHealth(update: Record<string, unknown>): void {
+  try {
+    let current: Record<string, unknown> = {}
+    try {
+      current = JSON.parse(readFileSync(HEALTH_FILE, 'utf8')) as Record<string, unknown>
+    } catch {}
+    const next = { ...current, ...update, updated_at: Math.floor(Date.now() / 1000) }
+    const tmp = `${HEALTH_FILE}.tmp`
+    writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, HEALTH_FILE)
+  } catch (err) {
+    process.stderr.write(`telegram channel: failed to write health: ${err}\n`)
+  }
+}
+
+function journalInbound(content: string, meta: ClaudeTeleInboundMeta): void {
+  try {
+    const row = {
+      journaled_at: Math.floor(Date.now() / 1000),
+      content,
+      meta,
+    }
+    appendFileSync(INBOUND_JOURNAL_FILE, JSON.stringify(row) + '\n', { mode: 0o600 })
+  } catch (err) {
+    process.stderr.write(`telegram channel: failed to journal inbound: ${err}\n`)
+  }
+}
+'''
+
+OLD_NOTIFICATION = r'''  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
+  // annotation is forgeable by any allowlisted sender typing that string.
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: text,
+      meta: {
+        chat_id,
+        ...(msgId != null ? { message_id: String(msgId) } : {}),
+        user: from.username ?? String(from.id),
+        user_id: String(from.id),
+        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        ...(imagePath ? { image_path: imagePath } : {}),
+        ...(attachment ? {
+          attachment_kind: attachment.kind,
+          attachment_file_id: attachment.file_id,
+          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+        } : {}),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+'''
+
+NEW_NOTIFICATION = r'''  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
+  // annotation is forgeable by any allowlisted sender typing that string.
+  const meta = {
+    chat_id,
+    ...(msgId != null ? { message_id: String(msgId) } : {}),
+    user: from.username ?? String(from.id),
+    user_id: String(from.id),
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    ...(imagePath ? { image_path: imagePath } : {}),
+    ...(attachment ? {
+      attachment_kind: attachment.kind,
+      attachment_file_id: attachment.file_id,
+      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    } : {}),
+  }
+  journalInbound(text, meta)
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: text,
+      meta,
+    },
+  }).then(() => {
+    writeHealth({ last_mcp_notify_ok_at: Math.floor(Date.now() / 1000), last_error: null })
+  }).catch(err => {
+    writeHealth({ last_mcp_notify_error_at: Math.floor(Date.now() / 1000), last_error: String(err) })
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+'''
+
+
+def ensure_import(text: str) -> str:
+  old = "import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'"
+  new = "import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'"
+  if new in text:
+    return text
+  if old not in text:
+    raise RuntimeError("missing fs import insertion point")
+  return text.replace(old, new, 1)
+
+
+def patch_file(path: Path) -> str:
+  text = path.read_text()
+  changed = False
+
+  text2 = ensure_import(text)
+  if text2 != text:
+    text = text2
+    changed = True
+
+  if OUTBOUND_MARKER not in text:
+    needle = "const bot = new Bot(TOKEN)\n"
+    if needle not in text:
+      raise RuntimeError(f"missing outbound insertion point in {path}")
+    text = text.replace(needle, needle + OUTBOUND_PATCH + "\n", 1)
+    changed = True
+
+  if INBOUND_MARKER not in text:
+    needle = "const PID_FILE = join(STATE_DIR, 'bot.pid')\n"
+    if needle not in text:
+      raise RuntimeError(f"missing inbound insertion point in {path}")
+    text = text.replace(needle, needle + INBOUND_PATCH + "\n", 1)
+    changed = True
+
+  if "journalInbound(text, meta)" not in text:
+    if OLD_NOTIFICATION not in text:
+      raise RuntimeError(f"missing notification replacement point in {path}")
+    text = text.replace(OLD_NOTIFICATION, NEW_NOTIFICATION, 1)
+    changed = True
+
+  if "writeHealth({ polling_started_at:" not in text:
+    old = "          process.stderr.write(`telegram channel: polling as @${info.username}\\n`)\n"
+    new = old + "          writeHealth({ polling_started_at: Math.floor(Date.now() / 1000), last_error: null })\n"
+    if old not in text:
+      raise RuntimeError(f"missing polling health insertion point in {path}")
+    text = text.replace(old, new, 1)
+    changed = True
+
+  if not changed:
+    return f"already patched: {path}"
+
+  path.write_text(text)
+  return f"patched: {path}"
+
+
+def main() -> int:
+  if not PLUGIN_ROOT.exists():
+    print(f"telegram plugin cache not present: {PLUGIN_ROOT}")
+    return 0
+
+  server_files = sorted(PLUGIN_ROOT.glob("*/server.ts"))
+  if not server_files:
+    print(f"no telegram plugin server.ts files under {PLUGIN_ROOT}")
+    return 0
+
+  for server in server_files:
+    print(patch_file(server))
+  return 0
+
+
+if __name__ == "__main__":
+  try:
+    raise SystemExit(main())
+  except Exception as exc:
+    print(f"claude-tele plugin patch failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)

@@ -1,0 +1,564 @@
+#!/bin/bash
+# claude-tele — lifecycle manager for the always-on Telegram Claude channel.
+#
+# Design (minimal, per Anthropic's plugin architecture):
+#   • systemd runs one Claude session: `claude --continue --channels plugin:telegram@claude-plugins-official`
+#   • Claude auto-spawns the bun MCP server (.mcp.json) which polls Telegram.
+#   • The bun MCP server handles duplicate-poller cleanup itself via
+#     ~/.claude/channels/telegram/bot.pid (SIGTERMs any stale holder).
+#   • Conversation state persists across restarts via `claude --continue`.
+#   • Runs from an isolated workdir so it doesn't hijack your $HOME session.
+#
+# Rule for the human: never run `claude --channels plugin:telegram…` outside
+# this service — a second bun will SIGTERM the systemd one's bun and steal the
+# bot token.
+#
+# Commands:
+#   start     Start service (idempotent).
+#   stop      Stop service cleanly.
+#   restart   Stop + start. Resumes conversation via --continue.
+#   status    Service / watchdog / tmux / claude / bun / context meter.
+#   attach    tmux attach to the live session.
+#   logs [-f] journalctl tail (service + watchdog).
+#   heal      Restart service (respawns missing bun). Safe: idempotent.
+#   compact [--json] [--force]
+#             Safely send /compact to the running Claude session if idle.
+#   replay-missed [--dry-run]
+#             Inject journaled Telegram messages missing from Claude transcripts.
+#   doctor    Preflight diagnostics.
+#
+# Internal (invoked by systemd):
+#   __exec-start   spawn tmux + claude (blocking)
+#   __exec-stop    tear it down
+
+set -euo pipefail
+
+readonly SESSION="telegram-claude"
+readonly SERVICE="telegram-claude.service"
+readonly WATCHDOG_SERVICE="telegram-claude-watchdog.service"
+readonly CLAUDE_BIN="${HOME}/.local/bin/claude"
+readonly STATE_DIR="${HOME}/.claude/channels/telegram"
+# Dedicated working directory for the telegram Claude session. Keeps its
+# conversation transcripts isolated from the user's interactive $HOME session.
+readonly WORKDIR="${STATE_DIR}/workdir"
+# Plugin's own PID file — written by ~/.claude/plugins/…/telegram/server.ts.
+readonly BOT_PID_FILE="${STATE_DIR}/bot.pid"
+readonly REPLAY_MISSED_BIN="${HOME}/bin/claude-tele-replay-missed"
+readonly WATCHDOG_STATE_FILE="${STATE_DIR}/watchdog.state"
+readonly COMPACT_INFLIGHT="${STATE_DIR}/compact.inflight"
+readonly COMPACT_SENTINEL_TTL="${CLAUDE_TELE_COMPACT_SENTINEL_TTL:-90}"
+# Mutex for mutating CLI commands. Prevents user+watchdog races.
+readonly CLI_LOCK="${STATE_DIR}/claude-tele.lock"
+# Mutex for the systemd ExecStart body — prevents two simultaneous spawns
+# (e.g. from daemon-reload + explicit restart) from racing on tmux cleanup.
+readonly EXEC_LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-tele.exec.lock"
+
+# ── Output helpers ─────────────────────────────────────────────────────────
+# [I-14] Color if stdout OR stderr is a TTY — die/warn write to stderr.
+if [ -t 1 ] || [ -t 2 ]; then
+  RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; BLUE=$'\e[34m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+else
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; DIM=""; RESET=""
+fi
+die()  { echo "${RED}error:${RESET} $*" >&2; exit 1; }
+warn() { echo "${YELLOW}warn:${RESET} $*" >&2; }
+ok()   { echo "${GREEN}✓${RESET} $*"; }
+info() { echo "${BLUE}→${RESET} $*"; }
+
+# ── Preflight ──────────────────────────────────────────────────────────────
+need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+need tmux
+need systemctl
+need flock
+[ -x "$CLAUDE_BIN" ] || die "claude binary missing: $CLAUDE_BIN"
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+
+# ── Health predicates ──────────────────────────────────────────────────────
+svc_active()     { systemctl --user is-active --quiet "$SERVICE"; }
+wd_active()      { systemctl --user is-active --quiet "$WATCHDOG_SERVICE"; }
+session_exists() { tmux has-session -t "$SESSION" 2>/dev/null; }
+
+# [H-3] bun_alive: trust the plugin's own bot.pid. Fall back to `pgrep -x bun`
+# + anchored cmdline match, not a bare `pgrep -f substring` which false-matches
+# tail/grep/editor invocations of the codebase.
+bun_alive() {
+  local pid
+  if [ -r "$BOT_PID_FILE" ]; then
+    pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && [ -d "/proc/$pid" ]; then
+      [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = "bun" ] && return 0
+    fi
+  fi
+  # Fallback: find any bun process whose cmdline contains the plugin path and
+  # whose comm is exactly "bun" (rules out scripts/editors matching the path).
+  local p
+  for p in $(pgrep -x bun 2>/dev/null || true); do
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null \
+         | grep -qF "claude-plugins-official/telegram"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+capture_pane() {
+  tmux capture-pane -t "$SESSION" -p -S -30 2>/dev/null || true
+}
+
+extract_pct() {
+  printf '%s\n' "$1" | grep -aE '[█▌░]' | grep -oE '[0-9]{1,3}%' | tail -1 | tr -d '%' || true
+}
+
+# Keep this conservative: only inject /compact when the pane looks idle. This
+# mirrors the watchdog guard so an MCP-triggered compact cannot type into a
+# prompt, modal, or in-flight tool call.
+pane_idle() {
+  local pane="$1"
+  local recent
+  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -8)
+
+  if printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'; then
+    return 0
+  fi
+  if printf '%s\n' "$recent" | grep -qE '(✻|⏳|↓ [0-9]+ tokens|Cogitat|Thinking|Working|Running tool|Calling |Executing)'; then
+    return 1
+  fi
+  if printf '%s\n' "$recent" | grep -qE '\?|\[y/N\]|Press Enter'; then
+    return 1
+  fi
+  return 0
+}
+
+compact_inflight() {
+  [ -f "$COMPACT_INFLIGHT" ] || return 1
+  local now mtime age
+  now=$(date +%s)
+  mtime=$(stat -c %Y "$COMPACT_INFLIGHT" 2>/dev/null) || mtime=0
+  age=$((now - mtime))
+  if [ "$age" -gt "$COMPACT_SENTINEL_TTL" ]; then
+    rm -f "$COMPACT_INFLIGHT"
+    return 1
+  fi
+  return 0
+}
+
+# Claude stores transcripts at ~/.claude/projects/<slug>/*.jsonl where the
+# slug replaces / with -. [M-7] Derive the slug from WORKDIR instead of
+# hardcoding — Anthropic's slugging could change.
+workdir_transcript_glob() {
+  local slug
+  slug="${WORKDIR//\//-}"
+  # Claude's project slugging replaces path separators and dots with dashes.
+  # Example transcript slug input: ${HOME}/.claude/channels/telegram/workdir
+  #   -> -home-ubuntu--claude-channels-telegram-workdir
+  slug="${slug//./-}"
+  echo "${HOME}/.claude/projects/${slug}/*.jsonl"
+}
+
+# [M-9] Recursive pane → claude PID walk. Claude may be wrapped by tmux's
+# default shell or systemd's exec wrapper; search up to 4 levels deep.
+resolve_claude_pid() {
+  session_exists || return 1
+  local pane_pid
+  pane_pid=$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [ -n "$pane_pid" ] || return 1
+  # BFS through descendants, bail at first comm=="claude".
+  local frontier="$pane_pid" next="" depth=0
+  while [ -n "$frontier" ] && [ "$depth" -lt 4 ]; do
+    next=""
+    local pid
+    for pid in $frontier; do
+      local comm
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+      if [ "$comm" = "claude" ]; then
+        echo "$pid"
+        return 0
+      fi
+      next+=" $(pgrep -P "$pid" 2>/dev/null || true)"
+    done
+    frontier="$next"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+# ── Internal: executed by systemd ──────────────────────────────────────────
+# [H-5] flock-guarded ExecStart so a second __exec-start from a concurrent
+# daemon-reload can't race on tmux cleanup. Non-blocking: a duplicate exits
+# immediately with a loud log line (systemd will mark the unit failed, which
+# is correct — only one instance should be spawning the session).
+cmd_exec_start() {
+  exec 9>"$EXEC_LOCK"
+  flock -n 9 || { echo "exec-start: another spawn is already in progress" >&2; exit 1; }
+
+  if session_exists; then
+    warn "stale tmux session '${SESSION}' — killing"
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+  fi
+
+  mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR"
+
+  # The official Telegram plugin lives in Claude's plugin cache, so updates can
+  # replace local fixes. Re-apply the outbound 429/backoff patch before every
+  # start so Telegram flood-control never drops chunks silently.
+  if [ -x "${HOME}/bin/claude-tele-patch-telegram-plugin" ]; then
+    "${HOME}/bin/claude-tele-patch-telegram-plugin"
+  else
+    warn "telegram plugin patch helper missing; outbound Telegram retry may be absent"
+  fi
+
+  # [M-7] Resume previous conversation if a transcript exists for THIS
+  # workdir's project slug.
+  local resume_flag=""
+  local glob
+  glob=$(workdir_transcript_glob)
+  if compgen -G "$glob" >/dev/null; then
+    resume_flag="--continue"
+    echo "resuming previous telegram conversation (slug: $(basename "$(dirname "$glob")"))"
+  else
+    # Warn loudly if neither the expected slug nor ANY transcript exists —
+    # catches Anthropic changing the slug encoding silently.
+    if compgen -G "${HOME}/.claude/projects/"*"/"*.jsonl >/dev/null 2>&1; then
+      warn "no transcript at expected slug — starting fresh (if conversations pile up, slug-encoding may have changed)"
+    else
+      echo "no prior transcript — starting fresh session"
+    fi
+  fi
+
+  # Build argv + shell-escape with printf %q. tmux new-session -c sets the
+  # session's cwd to our isolated workdir.
+  local -a argv=("$CLAUDE_BIN" --dangerously-skip-permissions)
+  [ -n "$resume_flag" ] && argv+=("$resume_flag")
+  argv+=(--channels "plugin:telegram@claude-plugins-official")
+  local cmd_str
+  printf -v cmd_str '%q ' "${argv[@]}"
+  tmux new-session -d -s "$SESSION" -c "$WORKDIR" -- "$cmd_str"
+
+  # [M-8] Poll the pane for the trust-prompt text rather than magic-sleeping.
+  # The prompt shows "Do you trust the files in this folder?" on first run
+  # only. If it appears, Enter accepts the default; if it doesn't within 30s,
+  # assume no prompt (subsequent run) and continue.
+  local i
+  for i in $(seq 1 30); do
+    local pane
+    pane=$(tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null || true)
+    if printf '%s\n' "$pane" | grep -q "trust the files"; then
+      tmux send-keys -t "$SESSION" -- Enter
+      echo "trust prompt accepted"
+      break
+    fi
+    # Also break early if the prompt "❯" has appeared (no trust dialog needed).
+    if printf '%s\n' "$pane" | tail -6 | grep -qE '^❯[[:space:]]*$'; then
+      break
+    fi
+    sleep 1
+  done
+
+  session_exists || { echo "failed to start tmux session" >&2; exit 1; }
+
+  if [ -x "$REPLAY_MISSED_BIN" ]; then
+    if replay_output=$("$REPLAY_MISSED_BIN" 2>&1); then
+      echo "${replay_output}"
+    else
+      warn "missed-message replay failed: ${replay_output}"
+    fi
+  else
+    warn "missed-message replay helper missing: ${REPLAY_MISSED_BIN}"
+  fi
+
+  echo "started (resume=${resume_flag:-no})"
+
+  # Block until the session dies. systemd tracks THIS process as the unit;
+  # when we exit, systemd's Restart= policy applies.
+  trap 'echo "exec-start: received signal, exiting"; exit 0' TERM INT
+  while session_exists; do
+    sleep 5
+  done
+  echo "tmux session ended — exec-start returning"
+}
+
+cmd_exec_stop() {
+  session_exists || { echo "already stopped"; return 0; }
+
+  # [M-6] Send SIGINT directly to the claude process instead of typing C-c
+  # into tmux — readline may eat keystrokes that looked like "clear input line".
+  local cpid
+  cpid=$(resolve_claude_pid || true)
+  if [ -n "${cpid:-}" ]; then
+    echo "sending SIGINT to claude pid ${cpid}"
+    kill -INT "$cpid" 2>/dev/null || true
+  else
+    # Fallback: double-tap C-c into tmux with a brief gap.
+    tmux send-keys -t "$SESSION" -- C-c 2>/dev/null || true
+    sleep 0.2
+    tmux send-keys -t "$SESSION" -- C-c 2>/dev/null || true
+  fi
+
+  # Wait up to 10s for graceful shutdown (transcript flush).
+  local i=0
+  while [ "$i" -lt 20 ] && session_exists; do
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  if session_exists; then
+    warn "session did not exit after 10s — force-killing tmux session"
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    sleep 1
+  fi
+
+  if session_exists; then
+    echo "ERROR: tmux session still present after kill-session" >&2
+    return 1
+  fi
+  echo "stopped"
+}
+
+# ── User-command mutex wrapper ─────────────────────────────────────────────
+# [H-2] Serialize mutating commands so user+watchdog don't race. Read-only
+# commands (status/attach/logs/doctor/help) do NOT take the lock.
+with_cli_lock() {
+  exec 8>"$CLI_LOCK"
+  if ! flock -w 30 8; then
+    die "another claude-tele command is in progress (lock: ${CLI_LOCK})"
+  fi
+  "$@"
+}
+
+# ── User commands ──────────────────────────────────────────────────────────
+cmd_start() {
+  if svc_active; then
+    ok "already running · ${DIM}connect with: claude-tele attach${RESET}"
+    return 0
+  fi
+  info "starting ${SERVICE}…"
+  systemctl --user start "$SERVICE"
+  sleep 3
+  if ! svc_active; then
+    systemctl --user status "$SERVICE" --no-pager | head -20 >&2
+    die "service failed to activate — run: claude-tele logs"
+  fi
+  ok "service started"
+  # Watchdog auto-pulls via BindsTo= — no manual start needed.
+  sleep 1
+  if wd_active; then
+    ok "watchdog auto-started (BindsTo)"
+  else
+    info "watchdog not yet active — starting explicitly"
+    systemctl --user start "$WATCHDOG_SERVICE" \
+      && ok "watchdog started" \
+      || warn "watchdog failed — telegram works; auto-compact won't"
+  fi
+}
+
+cmd_stop() {
+  svc_active || { ok "already stopped"; return 0; }
+  info "stopping ${SERVICE}…"
+  systemctl --user stop "$SERVICE"
+  ok "stopped"
+  # Watchdog auto-stops via BindsTo=.
+}
+
+# [H-33 + Obs-A] Remove the manual watchdog dance. BindsTo= handles it, and
+# `systemctl restart` is atomic (stop→start with proper ordering). A 10-second
+# warm-up at the top of the watchdog's main loop suppresses spurious heals
+# during the brief inactive window.
+cmd_restart() {
+  info "restarting ${SERVICE} (conversation resumes via --continue)…"
+  systemctl --user restart "$SERVICE"
+  sleep 3
+  svc_active || die "restart failed — run: claude-tele logs"
+  ok "restarted"
+}
+
+cmd_status() {
+  echo "${BLUE}── claude-tele status ──${RESET}"
+  if svc_active; then ok "service:  ${GREEN}active${RESET}"; else echo "${YELLOW}○ service:  inactive${RESET}"; fi
+  if wd_active;  then ok "watchdog: ${GREEN}active${RESET}"; else echo "${YELLOW}○ watchdog: inactive${RESET}"; fi
+  if session_exists; then ok "tmux:     '${SESSION}' present"; else echo "${RED}✗ tmux:     '${SESSION}' missing${RESET}"; fi
+
+  # [H-4] Split `local foo=$(...)` into declare + assign on separate lines so
+  # subshell exit codes aren't masked under set -e.
+  local cpid=""
+  if session_exists; then
+    cpid=$(resolve_claude_pid 2>/dev/null) || cpid=""
+    if [ -n "$cpid" ]; then
+      local rss
+      rss=$(awk '/VmRSS/ {printf "%.0f MB", $2/1024}' "/proc/${cpid}/status" 2>/dev/null) || rss="?"
+      ok "claude:   pid ${cpid} · rss ${rss}"
+    else
+      echo "${YELLOW}○ claude:   process not found in tmux tree${RESET}"
+    fi
+
+    local pane pct
+    pane=$(tmux capture-pane -t "$SESSION" -p -S -15 2>/dev/null) || pane=""
+    pct=$(printf '%s\n' "$pane" | grep -aE '[█▌░]' | grep -oE '[0-9]{1,3}%' | tail -1) || pct=""
+    [ -n "$pct" ] && ok "context:  ${pct}"
+  fi
+
+  if bun_alive; then
+    # Report the PID from bot.pid when available, else the first matching bun.
+    local bp=""
+    if [ -r "$BOT_PID_FILE" ]; then bp=$(cat "$BOT_PID_FILE" 2>/dev/null) || bp=""; fi
+    ok "bun:      pid ${bp:-?} (plugin bridge)"
+  else
+    if svc_active; then
+      echo "${RED}✗ bun:      missing — messages will NOT flow${RESET}"
+      echo "  ${DIM}fix: claude-tele heal${RESET}"
+    else
+      echo "${DIM}○ bun:      not running (service stopped)${RESET}"
+    fi
+  fi
+}
+
+cmd_attach() {
+  session_exists || die "session not running · start with: claude-tele start"
+  exec tmux attach -t "$SESSION"
+}
+
+# [L-11] Pass follow as a proper array element, not a quoted-empty-string arg.
+cmd_logs() {
+  local -a args=(--user -u "$SERVICE" -u "$WATCHDOG_SERVICE" -n 100 --no-pager)
+  case "${1:-}" in -f|--follow) args+=(-f) ;; esac
+  journalctl "${args[@]}"
+}
+
+# [M-10 + H-33] Heal is now just: ensure the service is running, restart if
+# bun is missing. No manual watchdog manipulation — BindsTo= handles it.
+cmd_heal() {
+  if svc_active && ! bun_alive; then
+    warn "service active but bun bridge missing — restarting"
+    cmd_restart
+    return
+  fi
+  if ! svc_active; then
+    info "service not running — starting"
+    cmd_start
+    return
+  fi
+  # Watchdog should be alive via BindsTo; pull it up if not.
+  if ! wd_active; then
+    info "watchdog not running — starting"
+    systemctl --user start "$WATCHDOG_SERVICE" && ok "watchdog started"
+  fi
+  ok "nothing to heal"
+}
+
+json_result() {
+  local ok_value="$1" status="$2" message="$3" context_before="${4:-}"
+  python3 - "$ok_value" "$status" "$message" "$context_before" <<'PY'
+import json, sys
+ok = sys.argv[1] == "true"
+payload = {"ok": ok, "status": sys.argv[2], "message": sys.argv[3]}
+if sys.argv[4]:
+    payload["context_before_pct"] = int(sys.argv[4])
+print(json.dumps(payload, indent=2))
+PY
+}
+
+compact_reply() {
+  local json="$1" ok_value="$2" status="$3" message="$4" context_before="${5:-}"
+  if [ "$json" = "1" ]; then
+    json_result "$ok_value" "$status" "$message" "$context_before"
+  elif [ "$ok_value" = "true" ]; then
+    ok "$message"
+  else
+    die "$message"
+  fi
+}
+
+cmd_compact() {
+  local json=0 force=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      --force) force=1 ;;
+      *) die "unknown compact option: $1" ;;
+    esac
+    shift
+  done
+
+  if ! session_exists; then
+    compact_reply "$json" false "not_running" "tmux session '${SESSION}' is not running"
+    return 1
+  fi
+  if compact_inflight && [ "$force" != "1" ]; then
+    compact_reply "$json" false "already_inflight" "compact is already in flight"
+    return 1
+  fi
+
+  local pane before
+  pane=$(capture_pane)
+  before=$(extract_pct "$pane")
+  if ! pane_idle "$pane"; then
+    compact_reply "$json" false "busy" "Claude session is busy; not sending /compact" "$before"
+    return 1
+  fi
+
+  date +%s > "$COMPACT_INFLIGHT"
+  date +%s > "$WATCHDOG_STATE_FILE"
+  tmux send-keys -t "$SESSION" -- "/compact" Enter
+  (
+    sleep "$COMPACT_SENTINEL_TTL"
+    rm -f "$COMPACT_INFLIGHT"
+  ) >/dev/null 2>&1 &
+
+  compact_reply "$json" true "requested" "compact requested" "$before"
+}
+
+cmd_replay_missed() {
+  [ -x "$REPLAY_MISSED_BIN" ] || die "missing replay helper: ${REPLAY_MISSED_BIN}"
+  "$REPLAY_MISSED_BIN" "$@"
+}
+
+# [L-12] Replace eval-based check()/soft() with a straight table to avoid
+# passing arbitrary strings to eval (internal-only, but sets a bad pattern).
+cmd_doctor() {
+  echo "${BLUE}── claude-tele doctor ──${RESET}"
+  local issues=0
+
+  local_check() {
+    local desc="$1" fatal="$2"; shift 2
+    if "$@" >/dev/null 2>&1; then
+      ok "$desc"
+    elif [ "$fatal" = "fatal" ]; then
+      echo "${RED}✗ $desc${RESET}"
+      issues=$((issues + 1))
+    else
+      warn "$desc"
+    fi
+  }
+
+  local_check "tmux installed"                                  fatal  command -v tmux
+  local_check "bun installed (plugin runtime)"                  fatal  command -v bun
+  local_check "claude binary at ${CLAUDE_BIN}"                  fatal  test -x "$CLAUDE_BIN"
+  local_check "bot .env present"                                fatal  test -f "${STATE_DIR}/.env"
+  local_check "bot .env permissions 600"                        fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/.env' 2>/dev/null) = '600' ]"
+  local_check "access.json present"                             fatal  test -f "${STATE_DIR}/access.json"
+  local_check "access.json permissions 600"                     fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/access.json' 2>/dev/null) = '600' ]"
+  local_check "service enabled on boot"                         soft   systemctl --user is-enabled --quiet "$SERVICE"
+  local_check "watchdog enabled on boot"                        soft   systemctl --user is-enabled --quiet "$WATCHDOG_SERVICE"
+  local_check "lingering enabled (survives logout) · fix: sudo loginctl enable-linger \$(id -un)" \
+                                                                fatal  bash -c "loginctl show-user \$(id -un) 2>/dev/null | grep -q 'Linger=yes'"
+
+  [ "$issues" -eq 0 ] && ok "all checks passed" || die "${issues} issue(s)"
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+# Mutating commands go through the CLI mutex; read-only ones do not.
+case "${1:-status}" in
+  start)          with_cli_lock cmd_start ;;
+  stop)           with_cli_lock cmd_stop ;;
+  restart)        with_cli_lock cmd_restart ;;
+  heal)           with_cli_lock cmd_heal ;;
+  compact)        shift; with_cli_lock cmd_compact "$@" ;;
+  replay-missed)  shift; cmd_replay_missed "$@" ;;
+  __exec-start)   cmd_exec_start ;;
+  __exec-stop)    cmd_exec_stop ;;
+  status)         cmd_status ;;
+  attach)         cmd_attach ;;
+  logs)           shift; cmd_logs "$@" ;;
+  doctor)         cmd_doctor ;;
+  help|-h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)              die "unknown command: $1 · try: claude-tele help" ;;
+esac

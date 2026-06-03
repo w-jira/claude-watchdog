@@ -1,0 +1,474 @@
+#!/bin/bash
+# claude-tele-watchdog — context auto-compactor + bun-bridge healer.
+#
+# Responsibilities (minimal by design):
+#   1. Auto-compact the Claude conversation when context % crosses THRESHOLD.
+#   2. Verify post-compact that context actually dropped; warn if it didn't.
+#   3. Detect a missing bun MCP bridge (service active but plugin subprocess
+#      gone) and `systemctl --user restart` the service.
+#   4. End-to-end Telegram liveness — `getMe` probe catches token rotation,
+#      bot disabled, Telegram API outages, IP blocks. Nothing else notices.
+#   5. Emit a heartbeat for external liveness checks.
+#   6. Circuit-breaker to prevent heal-restart loops.
+#
+# Duplicate-poller detection is NOT here — the Telegram plugin (server.ts)
+# handles stale bot.pid cleanup natively.
+#
+# Config via environment (systemd unit or shell for testing):
+#   WATCHDOG_THRESHOLD       Context-% that triggers /compact (default 40)
+#   WATCHDOG_COOLDOWN        Seconds between compacts (default 900)
+#   WATCHDOG_INTERVAL        Seconds between cycles (default 300)
+#   WATCHDOG_VERIFY_AFTER    Seconds before post-compact verify (default 30)
+#   WATCHDOG_GETME_EVERY     Cycles between Telegram getMe probes (default 3 = 15min)
+#   WATCHDOG_WARMUP          Seconds to skip heal checks on startup (default 10)
+#   WATCHDOG_DEBUG           1 = log extra per-check decisions (default 0)
+#   WATCHDOG_HEARTBEAT_LOG_EVERY  Cycles between healthy heartbeat logs (default 0 = off)
+
+set -euo pipefail
+
+readonly SESSION="telegram-claude"
+readonly SERVICE="telegram-claude.service"
+readonly STATE_DIR="${HOME}/.claude/channels/telegram"
+readonly STATE_FILE="${STATE_DIR}/watchdog.state"
+readonly HEARTBEAT_FILE="${STATE_DIR}/watchdog.heartbeat"
+readonly HEAL_STATE_FILE="${STATE_DIR}/watchdog.heal.state"
+readonly COMPACT_INFLIGHT="${STATE_DIR}/compact.inflight"
+readonly BACKOFF_FILE="${STATE_DIR}/watchdog.backoff"
+readonly BOT_PID_FILE="${STATE_DIR}/bot.pid"
+readonly ENV_FILE="${STATE_DIR}/.env"
+readonly LOG_TAG="claude-tele-watchdog"
+readonly ALERT_EMAIL="${WATCHDOG_ALERT_EMAIL:-}"
+readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
+readonly MSMTP_ACCOUNT="${WATCHDOG_MSMTP_ACCOUNT:-default}"
+
+THRESHOLD="${WATCHDOG_THRESHOLD:-40}"
+COOLDOWN="${WATCHDOG_COOLDOWN:-900}"
+INTERVAL="${WATCHDOG_INTERVAL:-300}"
+VERIFY_AFTER="${WATCHDOG_VERIFY_AFTER:-30}"
+GETME_EVERY="${WATCHDOG_GETME_EVERY:-3}"
+WARMUP="${WATCHDOG_WARMUP:-10}"
+DEBUG="${WATCHDOG_DEBUG:-0}"
+HEARTBEAT_LOG_EVERY="${WATCHDOG_HEARTBEAT_LOG_EVERY:-0}"
+
+# [H-16] Circuit-breaker: widened from 3-in-1800s (50% duty cycle) to 5-in-7200s.
+# Exponential backoff: 1st trip suppresses 30m, 2nd trip 2h, 3rd+ trips 24h + email.
+readonly HEAL_BURST_MAX=5
+readonly HEAL_BURST_WINDOW=7200
+readonly BACKOFF_STAGE_1=1800   # 30 min
+readonly BACKOFF_STAGE_2=7200   # 2 hr
+readonly BACKOFF_STAGE_3=86400  # 24 hr
+
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+
+# ── Logging (structured; whitelist level for logger -p) ────────────────────
+# [L-24] Whitelist the priority to avoid injection via future caller mistakes.
+log() {
+  local raw_lvl="$1"; shift
+  local msg="$1"; shift
+  local lvl
+  case "$raw_lvl" in
+    info|warning|err|crit) lvl="$raw_lvl" ;;
+    *)                     lvl="info" ;;
+  esac
+  local extra=""; [ "$#" -gt 0 ] && extra=" $*"
+  local line
+  line="[$(date -Iseconds)] lvl=${lvl} msg=\"${msg//\"/\\\"}\"${extra}"
+  echo "$line"
+  logger -t "$LOG_TAG" -p "user.${lvl}" -- "$line" 2>/dev/null || true
+}
+loginfo() { log info    "$@"; }
+logwarn() { log warning "$@"; }
+logerr()  { log err     "$@"; }
+logcrit() { log crit    "$@"; }
+logdebug() {
+  if [ "$DEBUG" = "1" ]; then
+    loginfo "debug: $*"
+  fi
+  return 0
+}
+
+current_sleep_pid=""
+shutdown() {
+  loginfo "shutdown"
+  if [ -n "${current_sleep_pid:-}" ]; then
+    kill "$current_sleep_pid" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap shutdown SIGTERM SIGINT
+
+nap() {
+  local seconds="$1"
+  sleep "$seconds" &
+  current_sleep_pid="$!"
+  wait "$current_sleep_pid" 2>/dev/null || true
+  current_sleep_pid=""
+}
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+# [L-25] Atomic heartbeat write (tmp + rename). Consumers reading mid-write
+# otherwise see truncated content.
+heartbeat() {
+  local tmp="${HEARTBEAT_FILE}.tmp"
+  date +%s >"$tmp" && mv "$tmp" "$HEARTBEAT_FILE"
+}
+
+svc_active() { systemctl --user is-active --quiet "$SERVICE"; }
+
+# [H-3] Mirror claude-tele's robust bun detector: trust bot.pid first, fall
+# back to comm-anchored pgrep. Never match via substring-only patterns.
+bun_alive() {
+  local pid
+  if [ -r "$BOT_PID_FILE" ]; then
+    pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && [ -d "/proc/$pid" ]; then
+      [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = "bun" ] && return 0
+    fi
+  fi
+  local p
+  for p in $(pgrep -x bun 2>/dev/null || true); do
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null \
+         | grep -qF "claude-plugins-official/telegram"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+capture_pane() { tmux capture-pane -t "$SESSION" -p -S -15 2>/dev/null || true; }
+
+extract_pct() {
+  # Status bar renders: "<project> ██████░░░░ NN%" — grab the last NN%.
+  printf '%s\n' "$1" | grep -aE '[█▌░]' | grep -oE '[0-9]{1,3}%' | tail -1 | tr -d '%' || true
+}
+
+# Detect current prompt/busy state from recent pane content only. Older scrollback can
+# contain stale "Thinking"/token lines long after Claude returned to the prompt.
+pane_idle() {
+  local pane="$1"
+  local recent
+  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -8)
+
+  # Prompt visible at the bottom means idle, even if older scrollback has busy markers.
+  if printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'; then
+    return 0
+  fi
+
+  # In-flight markers from Claude Code's UI. Check only recent lines to avoid
+  # stale scrollback suppressing compaction forever.
+  if printf '%s\n' "$recent" | grep -qE '(✻|⏳|↓ [0-9]+ tokens|Cogitat|Thinking|Working|Running tool|Calling |Executing)'; then
+    return 1
+  fi
+  # Question/modal prompts.
+  if printf '%s\n' "$recent" | grep -qE '\?|\[y/N\]|Press Enter'; then
+    return 1
+  fi
+  return 0
+}
+
+cooldown_remaining() {
+  local now last=0
+  now=$(date +%s)
+  if [ -f "$STATE_FILE" ]; then
+    last=$(cat "$STATE_FILE" 2>/dev/null) || last=0
+  fi
+  echo $((COOLDOWN - (now - last)))
+}
+
+# ── Heal circuit breaker (H-15/H-16) ───────────────────────────────────────
+# Record every attempt (not just failures — silent-restart loops exist when the
+# unit restarts cleanly but claude itself keeps crashing upstream). Exponential
+# backoff penalises persistent failure.
+backoff_remaining() {
+  [ -f "$BACKOFF_FILE" ] || { echo 0; return; }
+  local until_ts now
+  until_ts=$(cat "$BACKOFF_FILE" 2>/dev/null) || until_ts=0
+  now=$(date +%s)
+  if [ "$until_ts" -gt "$now" ]; then echo $((until_ts - now)); else echo 0; fi
+}
+
+# Count heals inside the burst window.
+heal_count_in_window() {
+  local now recent=0 cutoff
+  now=$(date +%s)
+  cutoff=$((now - HEAL_BURST_WINDOW))
+  if [ -f "$HEAL_STATE_FILE" ]; then
+    local ts
+    # [M-21] `|| [ -n "$ts" ]` handles files without trailing newline.
+    while IFS= read -r ts || [ -n "${ts:-}" ]; do
+      [ -n "$ts" ] && [ "$ts" -ge "$cutoff" ] && recent=$((recent + 1))
+    done < "$HEAL_STATE_FILE"
+  fi
+  echo "$recent"
+}
+
+record_heal() {
+  local now cutoff
+  now=$(date +%s)
+  cutoff=$((now - HEAL_BURST_WINDOW))
+  {
+    if [ -f "$HEAL_STATE_FILE" ]; then
+      local ts
+      while IFS= read -r ts || [ -n "${ts:-}" ]; do
+        [ -n "$ts" ] && [ "$ts" -ge "$cutoff" ] && echo "$ts"
+      done < "$HEAL_STATE_FILE"
+    fi
+    echo "$now"
+  } > "${HEAL_STATE_FILE}.tmp" && mv "${HEAL_STATE_FILE}.tmp" "$HEAL_STATE_FILE"
+}
+
+set_backoff() {
+  local secs="$1"
+  local until_ts
+  until_ts=$(( $(date +%s) + secs ))
+  echo "$until_ts" > "${BACKOFF_FILE}.tmp" && mv "${BACKOFF_FILE}.tmp" "$BACKOFF_FILE"
+}
+
+trip_count_in_window() {
+  # How many backoff-enforced trips recently? Derived from heal_count — each
+  # time we exceed HEAL_BURST_MAX is a trip.
+  local count
+  count=$(heal_count_in_window)
+  if [ "$count" -lt "$HEAL_BURST_MAX" ]; then
+    echo 0
+  elif [ "$count" -lt $((HEAL_BURST_MAX * 2)) ]; then
+    echo 1
+  elif [ "$count" -lt $((HEAL_BURST_MAX * 3)) ]; then
+    echo 2
+  else
+    echo 3
+  fi
+}
+
+send_alert_email() {
+  local subject="$1" body="$2"
+  [ -n "$ALERT_EMAIL" ] || return 0
+  command -v msmtp >/dev/null 2>&1 || return 0
+  printf "Subject: %s\r\nFrom: %s\r\nTo: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s\r\n" \
+    "$subject" "$ALERT_FROM" "$ALERT_EMAIL" "$body" | msmtp -a "$MSMTP_ACCOUNT" "$ALERT_EMAIL" 2>/dev/null || true
+}
+
+# [H-15] Record BEFORE attempt (not after); bump breaker regardless of heal
+# outcome. A successful `systemctl restart` doesn't mean the upstream failure
+# is fixed — only that systemd accepted the command.
+# [M-22] Use direct systemctl, not `claude-tele heal`. Eliminates reentrancy,
+# doesn't need a 30s timeout.
+invoke_heal() {
+  local reason="$1"
+
+  local back_rem
+  back_rem=$(backoff_remaining)
+  if [ "$back_rem" -gt 0 ]; then
+    logerr "heal suppressed by backoff" "reason=\"${reason}\" backoff_remaining=${back_rem}s"
+    return
+  fi
+
+  local in_window
+  in_window=$(heal_count_in_window)
+  if [ "$in_window" -ge "$HEAL_BURST_MAX" ]; then
+    # Trip backoff stage.
+    local trip stage_secs subject body
+    trip=$(trip_count_in_window)
+    case "$trip" in
+      0|1) stage_secs="$BACKOFF_STAGE_1"; subject="claude-tele: backoff stage 1 (30min)" ;;
+      2)   stage_secs="$BACKOFF_STAGE_2"; subject="claude-tele: backoff stage 2 (2h)" ;;
+      *)   stage_secs="$BACKOFF_STAGE_3"; subject="claude-tele: backoff stage 3 (24h) — INVESTIGATE" ;;
+    esac
+    set_backoff "$stage_secs"
+    body=$(cat <<EOF
+Telegram-claude watchdog tripped its circuit breaker.
+Reason for last heal attempt: ${reason}
+Heals in ${HEAL_BURST_WINDOW}s window: ${in_window}
+Trip count: ${trip}
+Backoff until: $(date -d "@$(($(date +%s) + stage_secs))" -Iseconds)
+
+Check:
+  journalctl --user -u telegram-claude.service -n 100
+  journalctl --user -u telegram-claude-watchdog.service -n 100
+  claude-tele status
+EOF
+)
+    logcrit "circuit breaker tripped" "trip=${trip} stage_secs=${stage_secs} in_window=${in_window}"
+    send_alert_email "$subject" "$body"
+    return
+  fi
+
+  logwarn "heal triggered" "reason=\"${reason}\""
+  record_heal
+  if timeout 90 systemctl --user restart "$SERVICE" >/dev/null 2>&1; then
+    loginfo "heal succeeded"
+  else
+    logerr "heal failed — systemctl restart non-zero"
+  fi
+}
+
+# ── Compact routine ────────────────────────────────────────────────────────
+send_compact() {
+  local before="$1"
+  # [M-19] Re-verify idleness immediately before sending. Tiny race window
+  # between outer check and this moment, but closes modal-injection risk.
+  local pane_now
+  pane_now=$(capture_pane)
+  if ! pane_idle "$pane_now"; then
+    loginfo "compact aborted — session became busy between check and send"
+    return
+  fi
+
+  loginfo "sending /compact" "ctx_before=${before}%"
+  date +%s > "$COMPACT_INFLIGHT"
+  date +%s > "$STATE_FILE"
+  tmux send-keys -t "$SESSION" -- "/compact" Enter
+
+  # [H-18] EXIT trap in verify subshell so SIGTERM during verification still
+  # clears the sentinel. Unit uses KillMode=mixed to give the subshell time.
+  (
+    trap 'rm -f "$COMPACT_INFLIGHT"' EXIT
+    sleep "$VERIFY_AFTER"
+    local after
+    after=$(extract_pct "$(capture_pane)")
+    if [ -z "$after" ]; then
+      logwarn "verify: no context meter found" "ctx_before=${before}%"
+    elif [ "$after" -ge "$before" ]; then
+      logwarn "verify: context did not drop" "ctx_before=${before}% ctx_after=${after}%"
+    else
+      loginfo "verify: context reduced" "ctx_before=${before}% ctx_after=${after}%"
+    fi
+  ) &
+}
+
+# Self-expiring compact-inflight sentinel (3× VERIFY_AFTER).
+compact_inflight() {
+  [ -f "$COMPACT_INFLIGHT" ] || return 1
+  local now mtime age
+  now=$(date +%s)
+  mtime=$(stat -c %Y "$COMPACT_INFLIGHT" 2>/dev/null) || mtime=0
+  age=$((now - mtime))
+  if [ "$age" -gt $((VERIFY_AFTER * 3)) ]; then
+    logwarn "stale compact-inflight sentinel cleared" "age=${age}s"
+    rm -f "$COMPACT_INFLIGHT"
+    return 1
+  fi
+  return 0
+}
+
+# ── Telegram getMe E2E probe (Obs-C) ───────────────────────────────────────
+# Catches what no other signal catches: token rotation, bot disabled by
+# BotFather, Telegram API outage, Cloudflare IP block. Runs every
+# GETME_EVERY cycles to avoid hammering the API.
+getme_probe() {
+  [ -r "$ENV_FILE" ] || return 0
+  local token
+  token=$(grep -oE '^TELEGRAM_BOT_TOKEN=[^[:space:]]+' "$ENV_FILE" 2>/dev/null | cut -d= -f2-) || token=""
+  [ -n "$token" ] || return 0
+
+  local resp http_code
+  resp=$(curl -s -o /tmp/.watchdog-getme.out -w '%{http_code}' \
+    --max-time 10 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null) || resp="000"
+  http_code="$resp"
+  rm -f /tmp/.watchdog-getme.out 2>/dev/null || true
+
+  if [ "$http_code" = "200" ]; then
+    return 0
+  else
+    logwarn "telegram getMe probe failed" "http_code=${http_code}"
+    return 1
+  fi
+}
+
+# ── Main loop ──────────────────────────────────────────────────────────────
+loginfo "started" "threshold=${THRESHOLD}% cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
+
+# [Obs-A] Warm-up: skip heal checks for WARMUP seconds so we don't fire during
+# the brief main-service inactive window on restart.
+if [ "$WARMUP" -gt 0 ]; then
+  loginfo "warming up" "skip_heal_for=${WARMUP}s"
+  nap "$WARMUP"
+fi
+
+cycle=0
+getme_fails=0
+while true; do
+  heartbeat
+  cycle=$((cycle + 1))
+
+  if [ "$HEARTBEAT_LOG_EVERY" -gt 0 ] && [ $((cycle % HEARTBEAT_LOG_EVERY)) -eq 0 ]; then
+    loginfo "watchdog heartbeat" "cycle=${cycle} interval=${INTERVAL}s getme_fails=${getme_fails}"
+  fi
+
+  # 1. Service inactive? Nothing to do — systemd's Restart= handles crashes.
+  if ! svc_active; then
+    logwarn "service inactive — skipping cycle"
+    nap "$INTERVAL"
+    continue
+  fi
+
+  # 2. Compact in progress? Skip heal + compact re-trigger.
+  if compact_inflight; then
+    logdebug "compact in-flight — skipping cycle" "cycle=${cycle}"
+    nap "$INTERVAL"
+    continue
+  fi
+
+  # 3. tmux session missing with active service → heal.
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    invoke_heal "tmux session missing"
+    nap "$INTERVAL"
+    continue
+  fi
+
+  # 4. bun bridge missing → messages can't flow → heal. Two consecutive
+  #    checks to absorb a fork/exec blip.
+  if ! bun_alive; then
+    logdebug "bun bridge missing on first check" "cycle=${cycle}"
+    nap 2
+    if ! bun_alive; then
+      invoke_heal "bun MCP bridge missing"
+      nap "$INTERVAL"
+      continue
+    else
+      logdebug "bun bridge recovered on second check" "cycle=${cycle}"
+    fi
+  fi
+
+  # 5. Telegram E2E liveness every GETME_EVERY cycles. Three consecutive
+  #    failures trigger heal (catches API outage + recovered-by-restart cases).
+  if [ $((cycle % GETME_EVERY)) -eq 0 ]; then
+    if getme_probe; then
+      logdebug "telegram getMe probe ok" "cycle=${cycle}"
+      getme_fails=0
+    else
+      getme_fails=$((getme_fails + 1))
+      if [ "$getme_fails" -ge 3 ]; then
+        logerr "telegram getMe failing repeatedly" "consecutive_fails=${getme_fails}"
+        invoke_heal "telegram getMe failed ${getme_fails}x"
+        getme_fails=0
+        sleep "$INTERVAL"
+        continue
+      fi
+    fi
+  fi
+
+  # 6. Auto-compact when context ≥ threshold AND session is idle.
+  pane=$(capture_pane)
+  pct=$(extract_pct "$pane") || pct=""
+  if [ -z "$pct" ] || ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+    logdebug "no context meter found — skipping compact check" "cycle=${cycle}"
+    nap "$INTERVAL"
+    continue
+  fi
+
+  logdebug "cycle ok" "cycle=${cycle} ctx=${pct}%"
+
+  if [ "$pct" -ge "$THRESHOLD" ]; then
+    remaining=$(cooldown_remaining)
+    if [ "$remaining" -gt 0 ]; then
+      loginfo "context high but cooldown active" "ctx=${pct}% cooldown_remaining=${remaining}s"
+    elif ! pane_idle "$pane"; then
+      loginfo "context high but session busy" "ctx=${pct}%"
+    else
+      send_compact "$pct"
+    fi
+  fi
+
+  nap "$INTERVAL"
+done

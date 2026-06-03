@@ -1,0 +1,62 @@
+[Unit]
+Description=Telegram-Claude context watchdog (auto-compact + self-heal)
+After=telegram-claude.service
+# [H-33 + M-34] BindsTo= force-stops the watchdog when main goes inactive and
+# auto-pulls it back up when main comes active. Requires= is redundant and
+# removed (BindsTo implies it).
+BindsTo=telegram-claude.service
+# [L-36] Widened from 30s: RestartSec=10 × StartLimitBurst=5 = 50s needs ≥ 60s.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+ExecStart=%h/bin/claude-tele-watchdog
+Restart=always
+RestartSec=10
+# [H-18] Give the verify subshell a chance to run its EXIT trap on shutdown.
+KillMode=mixed
+
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# [M-20 + L-30] UTF-8 locale required for tmux pane glyph detection.
+Environment=LANG=en_US.UTF-8
+Environment=LC_ALL=en_US.UTF-8
+Environment=WATCHDOG_THRESHOLD=38
+Environment=WATCHDOG_INTERVAL=10
+Environment=WATCHDOG_GETME_EVERY=90
+# Log one healthy heartbeat per minute at the 10s check interval.
+Environment=WATCHDOG_HEARTBEAT_LOG_EVERY=6
+# Set WATCHDOG_DEBUG=1 temporarily for verbose per-check logs; leave off by default.
+# Environment=WATCHDOG_DEBUG=1
+# Give Claude + Telegram bun bridge enough time to finish resume/replay before
+# heal checks. Startup commonly takes ~30s; 90s prevents false bun-missing heals
+# with extra margin for missed-message replay.
+Environment=WATCHDOG_WARMUP=90
+# Environment=WATCHDOG_COOLDOWN=900        # default: 15 min between compacts
+# Environment=WATCHDOG_VERIFY_AFTER=30     # default: seconds before post-compact check
+
+# Hardening — user-mode-safe subset.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Filesystem isolation: watchdog needs read of binary + state dir for
+# heartbeat/cooldown/backoff. No other home access.
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/bin %h/.local/bin
+BindPaths=%h/.claude/channels/telegram
+
+# Network: AF_INET + AF_INET6 required for the getMe E2E probe to
+# api.telegram.org. AF_UNIX for tmux + D-Bus. AF_NETLINK for /proc reads.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=default.target

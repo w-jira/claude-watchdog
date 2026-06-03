@@ -1,0 +1,59 @@
+[Unit]
+Description=Claude Code Telegram Channel (always-on)
+After=network-online.target
+Wants=network-online.target
+# [M-27] Widened from 120s: RestartSec=30 × StartLimitBurst=5 = 150s needs ≥ 150s window.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+[Service]
+# Type=simple — ExecStart blocks until the tmux session dies, so systemd
+# tracks liveness correctly. (Previous Type=forking + RemainAfterExit=yes
+# pinned the unit as "active" even after claude died, defeating Restart=.)
+Type=simple
+ExecStart=%h/bin/claude-tele __exec-start
+ExecStop=%h/bin/claude-tele __exec-stop
+Restart=always
+RestartSec=30
+TimeoutStopSec=30
+# [H-18] Give verify subshells time to clean sentinels during shutdown.
+KillMode=mixed
+
+# Environment needed for Claude CLI
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# [M-20 + L-30] UTF-8 locale so tmux/claude render status bar glyphs (█▌░❯)
+# the watchdog relies on. A non-UTF-8 locale would silently break detection.
+Environment=LANG=en_US.UTF-8
+Environment=LC_ALL=en_US.UTF-8
+Environment=TERM=xterm-256color
+# Dedicated workdir keeps telegram transcripts isolated — `claude --continue`
+# in $HOME would otherwise resume the user's interactive home-dir conversation.
+WorkingDirectory=%h/.claude/channels/telegram/workdir
+
+# Hardening — user-mode-safe subset. Capability-restricting directives
+# (CapabilityBoundingSet, AmbientCapabilities, ProtectSystem=strict,
+# ProtectKernelModules, ProtectKernelLogs) are rejected in user mode.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# [L-29] Node/bun V8 JIT requires writable+executable pages.
+MemoryDenyWriteExecute=false
+
+# Filesystem isolation: claude only needs write to ~/.claude (transcripts,
+# plugin cache, channels state). Everything else in $HOME is invisible.
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local %h/bin %h/.npm-global
+BindPaths=%h/.claude
+
+# Network: claude needs outbound to Anthropic; bun polls Telegram.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=default.target
