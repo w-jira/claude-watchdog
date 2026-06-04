@@ -28,14 +28,32 @@ ssh ubuntu@YOUR_SERVER_IP
 
 Use the username/IP your cloud provider gave you.
 
-## 2. Install the basic tools
+## 2. Install Node.js, Claude Code, and the system tools
+
+System packages:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git curl unzip tmux python3 ca-certificates openssl npm
+sudo apt-get install -y git curl unzip tmux python3 ca-certificates openssl
 ```
 
-If your Ubuntu image has an old Node.js/npm version, install a current Node.js LTS release from your preferred trusted source, then continue.
+claude-watchdog never installs Node.js or Claude Code for you — that keeps it conservative and avoids surprising changes to your machine. Install a current Node.js LTS using a trusted method (NodeSource, nvm, or Volta), then install and log in to Claude Code:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude            # complete the login, then exit
+```
+
+Prefer no global npm writes? Use a user-scoped prefix:
+
+```bash
+mkdir -p "$HOME/.npm-global"
+npm install -g --prefix "$HOME/.npm-global" @anthropic-ai/claude-code
+export PATH="$HOME/.npm-global/bin:$PATH"
+claude
+```
+
+Official Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 
 ## 3. Clone this repo
 
@@ -53,19 +71,11 @@ cd claude-watchdog
 
 The wizard will ask for your Telegram bot token. Paste it into the SSH terminal only. Do not paste it into chats, issues, screenshots, or logs.
 
-When asked whether to install missing supported dependencies, answer `y` if you want the installer to install Bun and Claude Code where possible. Claude Code installs through npm into your user directory (`~/.npm-global`), not with `sudo npm install -g`.
+`dog setup` first checks that Claude Code is installed and logged in. If it isn't, setup stops and tells you exactly what to run (you handled this in step 2). When asked whether to install missing system dependencies, answer `y` to let it install Bun and any missing OS packages — it will not install Node.js or Claude Code.
 
-## 5. Authenticate Claude Code
+## 5. If `claude` isn't found
 
-If Claude Code was just installed, authenticate it before starting the bot:
-
-```bash
-claude
-```
-
-Follow the login instructions, then exit Claude.
-
-If `claude` is not found after setup, check:
+You installed and logged in to Claude Code in step 2. If `dog setup` still can't find `claude`, check:
 
 ```bash
 ~/.local/bin/claude --version

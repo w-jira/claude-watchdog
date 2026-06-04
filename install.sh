@@ -9,6 +9,7 @@ TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 BUN_VERSION="${BUN_VERSION:-bun-v1.3.14}"
 INSTALL_DEPS=0
+INSTALL_CLAUDE=0
 START_SERVICE=0
 YES=0
 CLAUDE_INSTALLED_THIS_RUN=0
@@ -25,7 +26,8 @@ Usage: ./install.sh [options]
 One-stop installer for claude-watchdog.
 
 Options:
-  --install-deps              Install missing OS/user deps where supported.
+  --install-deps              Install missing system deps (apt packages + pinned Bun). Never Node/Claude Code.
+  --install-claude            Explicitly install Claude Code via npm (off by default; you still log in yourself).
   --token TOKEN               Write Telegram bot token to ~/.claude/channels/telegram/.env.
   --telegram-user-id ID       Allow this Telegram user ID in access.json.
   --permission-mode MODE       Claude permission mode: default, plan, acceptEdits, auto, dontAsk, bypassPermissions.
@@ -40,16 +42,17 @@ Agent-friendly example:
     ./install.sh --install-deps --start --yes
 
 Notes:
-  - If Claude Code is missing and npm is available, --install-deps installs it
-    into ~/.npm-global/bin and symlinks it into ~/.local/bin.
+  - Claude Code is NOT installed by default. Install + authenticate it yourself, or
+    pass --install-claude to install it via npm into ~/.npm-global (you still log in).
   - If bun is missing and --install-deps is set, this installs a pinned Bun release
-    into ~/.bun/bin and symlinks it into ~/bin.
+    into ~/.bun/bin (verified against the published SHA256SUMS) and symlinks it into ~/bin.
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --install-deps) INSTALL_DEPS=1 ;;
+    --install-claude) INSTALL_CLAUDE=1 ;;
     --start) START_SERVICE=1 ;;
     --menu) MENU=1 ;;
     --demo) DEMO_MODE=1 ;;
@@ -131,6 +134,19 @@ install_bun() {
   curl -fL --proto '=https' --tlsv1.2 \
     "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/${asset}" \
     -o "${tmp}/${asset}"
+  # Supply-chain: verify the download against the release's published SHA256SUMS
+  # before unzipping/executing it. HTTPS alone doesn't protect against a swapped
+  # or tampered release asset.
+  if has sha256sum; then
+    curl -fL --proto '=https' --tlsv1.2 \
+      "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/SHASUMS256.txt" \
+      -o "${tmp}/SHASUMS256.txt"
+    ( cd "$tmp" && grep -E "  ${asset}\$" SHASUMS256.txt | sha256sum -c - ) \
+      || die "bun checksum verification failed for ${asset} — refusing to install"
+    log "verified ${asset} against published SHA256SUMS"
+  else
+    warn "sha256sum not found — cannot verify bun download integrity; proceeding"
+  fi
   unzip -q "${tmp}/${asset}" -d "$tmp"
   zipdir="${tmp}/bun-linux-${arch}"
   install -d -m 700 "${HOME}/.bun/bin" "${HOME}/bin"
@@ -142,9 +158,9 @@ install_claude_code() {
   if has claude || [ -x "${HOME}/.local/bin/claude" ]; then
     return 0
   fi
-  [ "$INSTALL_DEPS" = "1" ] || return 0
+  [ "$INSTALL_CLAUDE" = "1" ] || return 0
   if ! has npm; then
-    warn "npm is missing; install a current Node.js LTS/npm, then re-run dog setup to install Claude Code"
+    warn "npm is missing; install a current Node.js LTS/npm, then re-run with --install-claude"
     return 0
   fi
 
@@ -297,6 +313,9 @@ PY
 if [ "$INSTALL_DEPS" = "1" ]; then
   install_apt_deps
   install_bun
+fi
+# Claude Code is decoupled from --install-deps: only installed on explicit opt-in.
+if [ "$INSTALL_CLAUDE" = "1" ]; then
   install_claude_code
 fi
 
@@ -345,5 +364,5 @@ if [ "$START_SERVICE" = "1" ]; then
 fi
 
 log "installed"
-log "next: claude-tele doctor"
-[ "$START_SERVICE" = "1" ] || log "then: claude-tele start"
+log "next: dog doctor"
+[ "$START_SERVICE" = "1" ] || log "then: dog start"

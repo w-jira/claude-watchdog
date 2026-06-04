@@ -36,6 +36,8 @@ readonly COMPACT_INFLIGHT="${STATE_DIR}/compact.inflight"
 readonly BACKOFF_FILE="${STATE_DIR}/watchdog.backoff"
 readonly BOT_PID_FILE="${STATE_DIR}/bot.pid"
 readonly ENV_FILE="${STATE_DIR}/.env"
+readonly TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
+readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 readonly LOG_TAG="claude-tele-watchdog"
 readonly ALERT_EMAIL="${WATCHDOG_ALERT_EMAIL:-}"
 readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
@@ -355,17 +357,37 @@ compact_inflight() {
 # Catches what no other signal catches: token rotation, bot disabled by
 # BotFather, Telegram API outage, Cloudflare IP block. Runs every
 # GETME_EVERY cycles to avoid hammering the API.
-getme_probe() {
-  [ -r "$ENV_FILE" ] || return 0
-  local token
-  token=$(grep -oE '^TELEGRAM_BOT_TOKEN=[^[:space:]]+' "$ENV_FILE" 2>/dev/null | cut -d= -f2-) || token=""
-  [ -n "$token" ] || return 0
+# Resolve the bot token the same way the runtime does: decrypt when the setup
+# stored it encrypted (the default/recommended path), else read plaintext.
+# Emits the token on stdout; returns non-zero if it can't be resolved.
+resolve_bot_token() {
+  [ -r "$ENV_FILE" ] || return 1
+  if grep -q '^TELEGRAM_BOT_TOKEN_ENCRYPTED=1' "$ENV_FILE" 2>/dev/null; then
+    [ -s "$TOKEN_ENC_FILE" ] && [ -s "$TOKEN_KEY_FILE" ] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    openssl enc -aes-256-cbc -d -pbkdf2 -pass "file:${TOKEN_KEY_FILE}" -in "$TOKEN_ENC_FILE" 2>/dev/null
+    return
+  fi
+  grep -oE '^TELEGRAM_BOT_TOKEN=[^[:space:]]+' "$ENV_FILE" 2>/dev/null | cut -d= -f2-
+}
 
-  local resp http_code
-  resp=$(curl -s -o /tmp/.watchdog-getme.out -w '%{http_code}' \
-    --max-time 10 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null) || resp="000"
-  http_code="$resp"
-  rm -f /tmp/.watchdog-getme.out 2>/dev/null || true
+getme_probe() {
+  local token
+  token="$(resolve_bot_token)" || token=""
+  if [ -z "$token" ]; then
+    # Could not resolve the token (e.g. encrypted but openssl/key unavailable).
+    # Do NOT return success silently — that would make this E2E probe a no-op
+    # for encrypted installs, exactly the failure it exists to catch. Surface it
+    # but don't trigger a heal on our own inability to read the token.
+    logwarn "telegram getMe probe skipped" "reason=token_unresolved"
+    return 0
+  fi
+
+  # Pass the token via a curl config file on stdin (-K -) so it never appears in
+  # argv / `ps` output.
+  local http_code
+  http_code=$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$token" \
+    | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - 2>/dev/null) || http_code="000"
 
   if [ "$http_code" = "200" ]; then
     return 0

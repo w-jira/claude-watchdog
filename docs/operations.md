@@ -1,5 +1,9 @@
 # Operations
 
+> Low-level / engine reference. Day-to-day, use the `dog` CLI (`dog status`, `dog restart`,
+> `dog doctor`, …). `claude-tele` is the underlying binary `dog` wraps; the direct `claude-tele`
+> and `install -m 700` commands below are for manual deploys and debugging.
+
 ## Validate
 
 ```bash
@@ -24,7 +28,7 @@ claude-tele restart
 ## Check health
 
 ```bash
-claude-tele status
-claude-tele replay-missed --dry-run
+dog status
+claude-tele replay-missed --dry-run   # engine-only power-user command
 journalctl --user -u telegram-claude.service -u telegram-claude-watchdog.service -n 100 --no-pager
 ```

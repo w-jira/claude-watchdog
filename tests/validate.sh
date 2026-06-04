@@ -15,6 +15,7 @@ systemd-analyze --user verify \
 secret_pattern='TELEGRAM_BOT_TOKEN=[0-9]+:|BEGIN (OPENSSH|RSA|EC|PRIVATE) KEY|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}'
 if grep -R --line-number -E "$secret_pattern" . \
   --exclude-dir=.git \
+  --exclude-dir=.claude \
   --exclude-dir=__pycache__ \
   --exclude='env.example' \
   --exclude='access.example.json'; then
@@ -34,6 +35,7 @@ telegram_id='7524'"762580"
 personal_pattern="${domain_one}|${domain_two}|${mail_one}|${mail_two}|${user_home}|${zt_prefix}|${public_prefix}|${telegram_id}"
 if grep -R --line-number -E "$personal_pattern" . \
   --exclude-dir=.git \
+  --exclude-dir=.claude \
   --exclude-dir=__pycache__; then
   echo "personal infrastructure string found" >&2
   exit 1

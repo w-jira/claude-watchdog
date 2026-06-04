@@ -53,7 +53,7 @@ The wizard asks for:
 - your Telegram user ID, which it can auto-detect by asking you to send a one-time test message to the bot
 - Claude permission mode
 - demo mode on/off
-- whether to install missing dependencies, including Claude Code when npm is available
+- whether to install missing system dependencies (Bun + OS packages) — it never installs Node.js or Claude Code for you
 - whether to start the bot immediately
 
 By default, `dog setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
@@ -64,16 +64,18 @@ The Linux/macOS encryption key is stored in the same private state directory as 
 
 ```bash
 dog help       # friendly command menu
-dog setup      # guided setup or reconfiguration
+dog setup      # guided setup or reconfiguration (--config-only writes config only)
+dog preflight  # check this machine is ready (Claude Code, deps, systemd)
 dog status     # service + bot status
 dog start      # start the bot
 dog stop       # stop the bot
 dog restart    # restart the bot
 dog doctor     # diagnostics
 dog logs       # logs; blocked in demo mode unless raw is requested
+dog uninstall  # remove service + binaries (--purge also removes config + token)
 ```
 
-Linux still exposes the lower-level power-user CLI:
+`dog` wraps an engine called `claude-tele`. Linux also exposes that engine directly for power users:
 
 ```bash
 claude-tele compact --json
@@ -91,11 +93,11 @@ claude-tele attach
 
 Before the bot can run, you need:
 
-- Claude Code CLI installed and authenticated; `dog setup` can install the CLI when npm is available, but you still need to complete Claude Code login yourself
+- Claude Code CLI installed and authenticated — you install it yourself (`npm install -g @anthropic-ai/claude-code`, then run `claude` to log in). `dog setup` checks for it and won't proceed without it; it never installs Node.js or Claude Code for you. See https://docs.anthropic.com/en/docs/claude-code
 - a Telegram bot token from BotFather
 - your Telegram user ID; `dog setup` can detect it automatically from a one-time test message
 
-Linux full mode also needs `systemd --user`. On Debian/Ubuntu, `dog setup` can install supported dependencies when you approve it.
+Linux full mode also needs `systemd --user`, plus `tmux`, `python3`, `git`, `openssl`, `curl`, and `unzip`. On Debian/Ubuntu, `dog setup` can install these system dependencies (and a pinned, checksum-verified Bun) when you approve it — but never Node.js or Claude Code.
 
 ## Permissions
 

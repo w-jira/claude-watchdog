@@ -12,6 +12,7 @@ DEMO_MODE="${CLAUDE_WATCHDOG_DEMO:-0}"
 PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
 START_SERVICE=0
 INSTALL_DEPS=0
+INSTALL_CLAUDE=0
 YES=0
 CLAUDE_INSTALLED_THIS_RUN=0
 
@@ -22,7 +23,8 @@ Usage: ./install-macos.sh [options]
 macOS installer for claude-watchdog. Installs a LaunchAgent + tmux runner.
 
 Options:
-  --install-deps              Install missing deps with Homebrew where available.
+  --install-deps              Install missing deps with Homebrew where available. Never Claude Code.
+  --install-claude            Explicitly install Claude Code via npm (off by default; you still log in yourself).
   --token TOKEN               Write Telegram bot token to ~/.claude/channels/telegram/.env.
   --telegram-user-id ID       Allow this Telegram user ID in access.json.
   --permission-mode MODE       Claude permission mode: default, plan, acceptEdits, auto, dontAsk, bypassPermissions.
@@ -45,6 +47,7 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --install-deps) INSTALL_DEPS=1 ;;
+    --install-claude) INSTALL_CLAUDE=1 ;;
     --start) START_SERVICE=1 ;;
     --demo) DEMO_MODE=1 ;;
     -y|--yes) YES=1 ;;
@@ -104,9 +107,9 @@ install_claude_code() {
   if [ -n "$(resolve_claude)" ]; then
     return 0
   fi
-  [ "$INSTALL_DEPS" = "1" ] || return 0
+  [ "$INSTALL_CLAUDE" = "1" ] || return 0
   if ! has npm; then
-    warn "npm is missing; install a current Node.js LTS/npm, then re-run dog setup to install Claude Code"
+    warn "npm is missing; install a current Node.js LTS/npm, then re-run with --install-claude"
     return 0
   fi
 
@@ -258,5 +261,5 @@ if [ "$START_SERVICE" = "1" ]; then
 fi
 
 log "installed"
-log "next: claude-tele doctor"
-[ "$START_SERVICE" = "1" ] || log "then: claude-tele start"
+log "next: dog doctor"
+[ "$START_SERVICE" = "1" ] || log "then: dog start"
