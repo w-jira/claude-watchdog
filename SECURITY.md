@@ -27,6 +27,11 @@ dog doctor
 
 before recovery work. (`dog` is the user-facing CLI; `claude-tele` is the engine it wraps.)
 
+`dog tell` sends local text directly into the running Claude terminal through tmux. It avoids
+starting a second Telegram poller, but it is not an encrypted secret channel and it bypasses
+Telegram allowlist checks. Do not send tokens, passwords, `.env` contents, or other secrets
+through it.
+
 ## Token at rest
 
 When OpenSSL is available, `dog setup` stores the bot token AES-256-CBC-encrypted in

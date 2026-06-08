@@ -9,6 +9,7 @@ TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
+TMUX_SESSION="${CLAUDE_TELE_SESSION:-telegram-claude}"
 
 # --plain (also NO_COLOR, or a non-TTY stdout) disables color + ASCII art so
 # output stays clean over SSH, in CI, and in logs.
@@ -25,13 +26,12 @@ else
   BOLD=""; BLUE=""; GREEN=""; YELLOW=""; RED=""; DIM=""; RESET=""
 fi
 
-# Drop global flags from positional args so command dispatch still works.
-_args=()
-for _arg in "$@"; do
-  [ "$_arg" = "--plain" ] && continue
-  _args+=("$_arg")
+# Drop leading global flags from positional args so command dispatch still works
+# without mutating command data such as `dog tell "use --plain"`.
+while [ "${1:-}" = "--plain" ]; do
+  shift
 done
-set -- "${_args[@]:-help}"
+[ "$#" -gt 0 ] || set -- help
 
 log() { printf '%s\n' "$*"; }
 ok() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
@@ -123,6 +123,31 @@ preflight() {
   ok "preflight passed"
 }
 
+cmd_tell() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required"
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null || die "Claude session not running; start it with: dog start"
+
+  local message=""
+  if [ "$#" -gt 0 ]; then
+    message="$*"
+  elif [ ! -t 0 ]; then
+    message="$(cat)"
+  else
+    die "message required. Usage: dog tell \"status?\"  (or pipe text into dog tell)"
+  fi
+  [ -n "$message" ] || die "message is empty"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/dog-tell.XXXXXX")"
+  trap 'rm -f "$tmp"; trap - RETURN' RETURN
+  printf '%s\n' "$message" > "$tmp"
+  tmux load-buffer -t "$TMUX_SESSION" "$tmp"
+  tmux paste-buffer -t "$TMUX_SESSION"
+  tmux delete-buffer 2>/dev/null || true
+  tmux send-keys -t "$TMUX_SESSION" Enter
+  ok "sent to Claude session"
+}
+
 cmd_uninstall() {
   local purge=0
   for a in "$@"; do [ "$a" = "--purge" ] && purge=1; done
@@ -167,6 +192,7 @@ Commands:
   setup        Guided setup/reconfiguration. Reads the token hidden, encrypts it at rest.
                Flag: --config-only  (write config, skip service install/start)
   preflight    Check this machine is ready to set up (Claude Code, deps, systemd).
+  tell         Send a note to the live Claude session. Example: dog tell "status?"
   uninstall    Remove the service + binaries. Flag: --purge (also delete config + token).
   help         Show this menu.
 
@@ -179,7 +205,7 @@ Daily use (these wrap the claude-tele engine):
   dog logs       Show logs (blocked in demo mode unless raw is requested).
 
 Global:
-  --plain        Disable color + ASCII banner (also honors NO_COLOR / non-TTY).
+  --plain        Disable color + ASCII banner (also honors NO_COLOR / CI / non-TTY).
 EOF
 }
 
@@ -415,9 +441,10 @@ EOF
 }
 
 case "${1:-help}" in
-  setup) cmd_setup "$@" ;;
+  setup) cmd_setup "${@:2}" ;;
   preflight) preflight ;;
-  uninstall) cmd_uninstall "$@" ;;
+  tell) shift; cmd_tell "$@" ;;
+  uninstall) cmd_uninstall "${@:2}" ;;
   status|start|stop|restart|doctor|logs) command -v claude-tele >/dev/null 2>&1 || die "the claude-tele engine isn't installed yet; run: dog setup"; claude-tele "$@" ;;
   help|-h|--help) usage ;;
   *) die "unknown command: $1" ;;

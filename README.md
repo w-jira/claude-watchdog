@@ -66,6 +66,7 @@ The Linux/macOS encryption key is stored in the same private state directory as 
 dog help       # friendly command menu
 dog setup      # guided setup or reconfiguration (--config-only writes config only)
 dog preflight  # check this machine is ready (Claude Code, deps, systemd)
+dog tell "status?" # send a note to the live Claude session without Telegram
 dog status     # service + bot status
 dog start      # start the bot
 dog stop       # stop the bot
@@ -74,6 +75,8 @@ dog doctor     # diagnostics
 dog logs       # logs; blocked in demo mode unless raw is requested
 dog uninstall  # remove service + binaries (--purge also removes config + token)
 ```
+
+`dog tell` is a local control channel into the existing Claude terminal. It pastes your note into the already-running tmux session and presses Enter. It does not start a second Telegram poller and it does not test Telegram delivery. Use it for quick steering or status checks; do not send secrets through it.
 
 `dog` wraps an engine called `claude-tele`. Linux also exposes that engine directly for power users:
 

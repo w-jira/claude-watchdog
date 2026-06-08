@@ -97,6 +97,14 @@ dog status
 
 Send a message to your Telegram bot from the account you allowlisted during setup.
 
+You can also steer the local Claude session directly from SSH without going through Telegram:
+
+```bash
+dog tell "status?"
+```
+
+That is useful for quick checks while you are already on the server. It pastes into the running Claude terminal, so do not use it for secrets.
+
 ## Common choices during setup
 
 - Permission mode: choose `default` for your first install.
