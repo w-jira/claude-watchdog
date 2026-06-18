@@ -7,14 +7,15 @@
 ## Validate
 
 ```bash
-bash -n bin/claude-tele bin/claude-tele-watchdog
-python3 -m py_compile bin/claude-tele-patch-telegram-plugin bin/claude-tele-replay-missed
-systemd-analyze --user verify systemd/user/telegram-claude.service systemd/user/telegram-claude-watchdog.service
+tests/validate.sh
 ```
+
+`tests/validate.sh` runs shell syntax checks, Python compile checks, replay health-gate regression tests, and user-systemd unit verification. It requires `pytest` for the regression tests.
 
 ## Deploy to current VPS layout
 
 ```bash
+install -m 700 bin/dog ~/bin/dog
 install -m 700 bin/claude-tele ~/bin/claude-tele
 install -m 700 bin/claude-tele-watchdog ~/bin/claude-tele-watchdog
 install -m 700 bin/claude-tele-patch-telegram-plugin ~/bin/claude-tele-patch-telegram-plugin

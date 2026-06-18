@@ -319,7 +319,7 @@ if [ "$INSTALL_CLAUDE" = "1" ]; then
   install_claude_code
 fi
 
-mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}"
+mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}" "${HOME}/.npm-global"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
 
 install -m 700 "${ROOT}/bin/claude-tele" "${HOME}/bin/claude-tele"

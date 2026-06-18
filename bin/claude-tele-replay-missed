@@ -26,8 +26,10 @@ STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR", Path.home() / ".claude" / 
 WORKDIR = Path(os.environ.get("CLAUDE_TELE_WORKDIR", STATE_DIR / "workdir"))
 JOURNAL_FILE = Path(os.environ.get("CLAUDE_TELE_INBOUND_JOURNAL", STATE_DIR / "inbound-journal.jsonl"))
 ACK_FILE = Path(os.environ.get("CLAUDE_TELE_REPLAY_ACK", STATE_DIR / "replayed-inbound.jsonl"))
+HEALTH_FILE = Path(os.environ.get("CLAUDE_TELE_PLUGIN_HEALTH", STATE_DIR / "plugin-health.json"))
 MIN_AGE_SECONDS = int(os.environ.get("CLAUDE_TELE_REPLAY_MIN_AGE", "30"))
 MAX_REPLAY = int(os.environ.get("CLAUDE_TELE_REPLAY_MAX", "20"))
+HEALTH_MAX_AGE_SECONDS = int(os.environ.get("CLAUDE_TELE_HEALTH_MAX_AGE", "1200"))
 
 
 def project_slug(path: Path) -> str:
@@ -85,6 +87,65 @@ def delivered_keys_from_transcripts() -> set[str]:
 
 def replayed_keys() -> set[str]:
   return {key for row in load_jsonl(ACK_FILE) if (key := message_key(row))}
+
+
+def _health_ts(health: dict[str, Any], key: str) -> int:
+  try:
+    return int(health.get(key) or 0)
+  except (TypeError, ValueError):
+    return 0
+
+
+def telegram_e2e_healthy(now: int | None = None) -> tuple[bool, str]:
+  """Return whether it is safe to inject into Claude's live Telegram session.
+
+  Missed-message replay bypasses the Telegram plugin by pasting directly into
+  tmux. Fail closed unless the watchdog has recently proven the Telegram Bot
+  API is reachable and the plugin has started polling. This prevents restart or
+  heal loops from repeatedly injecting old messages while Telegram delivery is
+  broken.
+  """
+  if os.environ.get("CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE") == "1":
+    return True, "gate_disabled"
+
+  now = int(time.time()) if now is None else now
+  try:
+    health = json.loads(HEALTH_FILE.read_text(encoding="utf-8"))
+  except FileNotFoundError:
+    return False, "health_missing"
+  except (OSError, json.JSONDecodeError):
+    return False, "health_unreadable"
+  if not isinstance(health, dict):
+    return False, "health_invalid"
+
+  polling_started_at = _health_ts(health, "polling_started_at")
+  if polling_started_at <= 0:
+    return False, "polling_not_started"
+  service_started_at = _health_ts(health, "service_started_at")
+  if service_started_at > 0 and polling_started_at < service_started_at:
+    return False, "polling_before_service_start"
+
+  last_getme_ok_at = _health_ts(health, "last_getme_ok_at")
+  if last_getme_ok_at <= 0:
+    return False, "getme_never_ok"
+  if service_started_at > 0 and last_getme_ok_at < service_started_at:
+    return False, "getme_before_service_start"
+  if now - last_getme_ok_at > HEALTH_MAX_AGE_SECONDS:
+    return False, "getme_stale"
+
+  last_getme_error_at = _health_ts(health, "last_getme_error_at")
+  if last_getme_error_at > last_getme_ok_at:
+    return False, "getme_error_after_ok"
+
+  last_mcp_notify_ok_at = _health_ts(health, "last_mcp_notify_ok_at")
+  last_mcp_notify_error_at = _health_ts(health, "last_mcp_notify_error_at")
+  if last_mcp_notify_error_at > last_mcp_notify_ok_at:
+    return False, "mcp_notify_error_after_ok"
+
+  if health.get("last_error") and last_mcp_notify_error_at >= max(last_mcp_notify_ok_at, last_getme_ok_at):
+    return False, "recent_error"
+
+  return True, "ok"
 
 
 def pending_rows() -> list[dict[str, Any]]:
@@ -149,6 +210,29 @@ def tmux_has_session() -> bool:
   return subprocess.run(["tmux", "has-session", "-t", SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
+def capture_pane() -> str:
+  result = subprocess.run(
+    ["tmux", "capture-pane", "-t", SESSION, "-p", "-S", "-30"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    check=False,
+  )
+  return result.stdout
+
+
+def pane_idle(pane: str) -> bool:
+  recent_lines = [line for line in pane.splitlines() if line.strip()][-8:]
+  recent = "\n".join(recent_lines)
+  if any(re.match(r"^❯\s*$", line) for line in recent_lines[-3:]):
+    return True
+  if re.search(r"(✻|⏳|↓ [0-9]+ tokens|Cogitat|Thinking|Working|Running tool|Calling |Executing)", recent):
+    return False
+  if re.search(r"\?|\[y/N\]|Press Enter", recent):
+    return False
+  return False
+
+
 def inject(prompt: str) -> None:
   if not tmux_has_session():
     raise RuntimeError(f"tmux session not found: {SESSION}")
@@ -189,6 +273,13 @@ def main() -> int:
   if args.dry_run:
     print(prompt)
   else:
+    healthy, reason = telegram_e2e_healthy()
+    if not healthy:
+      print(f"replay skipped: telegram e2e unhealthy ({reason}); {len(rows)} missed message(s) left pending")
+      return 0
+    if not pane_idle(capture_pane()):
+      print(f"replay skipped: session busy; {len(rows)} missed message(s) left pending")
+      return 0
     inject(prompt)
     print(f"replayed {len(rows)} missed Telegram message(s) into tmux session {SESSION}")
 

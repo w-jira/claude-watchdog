@@ -8,6 +8,7 @@ python3 -m py_compile \
   bin/claude-tele-patch-telegram-plugin \
   bin/claude-tele-replay-missed \
   bin/claude-tele-control-mcp.py
+python3 -m pytest tests/test_replay_health_gate.py -q
 systemd-analyze --user verify \
   systemd/user/telegram-claude.service \
   systemd/user/telegram-claude-watchdog.service

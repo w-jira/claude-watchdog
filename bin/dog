@@ -7,6 +7,7 @@ ENV_FILE="${STATE_DIR}/.env"
 ACCESS_FILE="${STATE_DIR}/access.json"
 TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
+HEALTH_FILE="${STATE_DIR}/plugin-health.json"
 
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 TMUX_SESSION="${CLAUDE_TELE_SESSION:-telegram-claude}"
@@ -68,6 +69,44 @@ claude_auth_hint() {
   return 1
 }
 
+telegram_e2e_healthy() {
+  [ "${CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE:-0}" = "1" ] && return 0
+  python3 - "$HEALTH_FILE" "${CLAUDE_TELE_HEALTH_MAX_AGE:-1200}" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+max_age = int(sys.argv[2])
+try:
+    health = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(health, dict):
+        raise ValueError("invalid health")
+except Exception:
+    raise SystemExit(1)
+now = int(time.time())
+def ts(key):
+    try:
+        return int(health.get(key) or 0)
+    except Exception:
+        return 0
+getme_ok = ts("last_getme_ok_at")
+polling_started = ts("polling_started_at")
+service_started = ts("service_started_at")
+if polling_started <= 0 or getme_ok <= 0 or now - getme_ok > max_age:
+    raise SystemExit(1)
+if service_started > 0 and polling_started < service_started:
+    raise SystemExit(1)
+if service_started > 0 and getme_ok < service_started:
+    raise SystemExit(1)
+if ts("last_getme_error_at") > getme_ok:
+    raise SystemExit(1)
+notify_ok = ts("last_mcp_notify_ok_at")
+notify_err = ts("last_mcp_notify_error_at")
+if notify_err > notify_ok:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 print_claude_install_help() {
   cat >&2 <<'EOF'
 
@@ -126,6 +165,7 @@ preflight() {
 cmd_tell() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required"
   tmux has-session -t "$TMUX_SESSION" 2>/dev/null || die "Claude session not running; start it with: dog start"
+  telegram_e2e_healthy || die "Telegram E2E health is not fresh; refusing to inject into Claude session"
 
   local message=""
   if [ "$#" -gt 0 ]; then

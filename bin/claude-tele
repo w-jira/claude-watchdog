@@ -60,6 +60,7 @@ readonly REPLAY_MISSED_BIN="${HOME}/bin/claude-tele-replay-missed"
 readonly WATCHDOG_STATE_FILE="${STATE_DIR}/watchdog.state"
 readonly COMPACT_INFLIGHT="${STATE_DIR}/compact.inflight"
 readonly COMPACT_SENTINEL_TTL="${CLAUDE_TELE_COMPACT_SENTINEL_TTL:-90}"
+readonly HEALTH_FILE="${STATE_DIR}/plugin-health.json"
 # Mutex for mutating CLI commands. Prevents user+watchdog races.
 readonly CLI_LOCK="${STATE_DIR}/claude-tele.lock"
 # Mutex for the systemd ExecStart body — prevents two simultaneous spawns
@@ -192,6 +193,44 @@ compact_inflight() {
   return 0
 }
 
+telegram_e2e_healthy() {
+  [ "${CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE:-0}" = "1" ] && return 0
+  python3 - "$HEALTH_FILE" "${CLAUDE_TELE_HEALTH_MAX_AGE:-1200}" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+max_age = int(sys.argv[2])
+try:
+    health = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(health, dict):
+        raise ValueError("invalid health")
+except Exception:
+    raise SystemExit(1)
+now = int(time.time())
+def ts(key):
+    try:
+        return int(health.get(key) or 0)
+    except Exception:
+        return 0
+getme_ok = ts("last_getme_ok_at")
+polling_started = ts("polling_started_at")
+service_started = ts("service_started_at")
+if polling_started <= 0 or getme_ok <= 0 or now - getme_ok > max_age:
+    raise SystemExit(1)
+if service_started > 0 and polling_started < service_started:
+    raise SystemExit(1)
+if service_started > 0 and getme_ok < service_started:
+    raise SystemExit(1)
+if ts("last_getme_error_at") > getme_ok:
+    raise SystemExit(1)
+notify_ok = ts("last_mcp_notify_ok_at")
+notify_err = ts("last_mcp_notify_error_at")
+if notify_err > notify_ok:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 # Claude stores transcripts at ~/.claude/projects/<slug>/*.jsonl where the
 # slug replaces / with -. [M-7] Derive the slug from WORKDIR instead of
 # hardcoding — Anthropic's slugging could change.
@@ -247,6 +286,30 @@ cmd_exec_start() {
   fi
 
   mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR"
+  python3 - "$HEALTH_FILE" <<'PY' || true
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    current = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(current, dict):
+        current = {}
+except Exception:
+    current = {}
+now = int(time.time())
+current.update({
+    "service_started_at": now,
+    "polling_started_at": 0,
+    "last_mcp_notify_ok_at": 0,
+    "last_mcp_notify_error_at": 0,
+    "last_error": "service starting",
+    "updated_at": now,
+})
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+tmp.chmod(0o600)
+tmp.replace(path)
+PY
 
   # The official Telegram plugin lives in Claude's plugin cache, so updates can
   # replace local fixes. Re-apply the outbound 429/backoff patch before every
@@ -415,7 +478,7 @@ cmd_start() {
     return 0
   fi
   info "starting ${SERVICE}…"
-  systemctl --user start "$SERVICE"
+  systemctl --user enable --now "$SERVICE"
   sleep 3
   if ! svc_active; then
     systemctl --user status "$SERVICE" --no-pager | head -20 >&2
@@ -428,7 +491,7 @@ cmd_start() {
     ok "watchdog auto-started (BindsTo)"
   else
     info "watchdog not yet active — starting explicitly"
-    systemctl --user start "$WATCHDOG_SERVICE" \
+    systemctl --user enable --now "$WATCHDOG_SERVICE" \
       && ok "watchdog started" \
       || warn "watchdog failed — telegram works; auto-compact won't"
   fi
@@ -539,7 +602,7 @@ cmd_heal() {
   # Watchdog should be alive via BindsTo; pull it up if not.
   if ! wd_active; then
     info "watchdog not running — starting"
-    systemctl --user start "$WATCHDOG_SERVICE" && ok "watchdog started"
+    systemctl --user enable --now "$WATCHDOG_SERVICE" && ok "watchdog started"
   fi
   ok "nothing to heal"
 }
@@ -592,6 +655,10 @@ cmd_compact() {
   before=$(extract_pct "$pane")
   if ! pane_idle "$pane"; then
     compact_reply "$json" false "busy" "Claude session is busy; not sending /compact" "$before"
+    return 1
+  fi
+  if ! telegram_e2e_healthy; then
+    compact_reply "$json" false "telegram_unhealthy" "Telegram E2E health is not fresh; not injecting /compact" "$before"
     return 1
   fi
 

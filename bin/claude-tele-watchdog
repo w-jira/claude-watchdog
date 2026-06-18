@@ -38,6 +38,7 @@ readonly BOT_PID_FILE="${STATE_DIR}/bot.pid"
 readonly ENV_FILE="${STATE_DIR}/.env"
 readonly TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
+readonly HEALTH_FILE="${STATE_DIR}/plugin-health.json"
 readonly LOG_TAG="claude-tele-watchdog"
 readonly ALERT_EMAIL="${WATCHDOG_ALERT_EMAIL:-}"
 readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
@@ -315,6 +316,10 @@ send_compact() {
     loginfo "compact aborted — session became busy between check and send"
     return
   fi
+  if ! telegram_e2e_healthy; then
+    logwarn "compact aborted — Telegram E2E health is not fresh"
+    return
+  fi
 
   loginfo "sending /compact" "ctx_before=${before}%"
   date +%s > "$COMPACT_INFLIGHT"
@@ -351,6 +356,44 @@ compact_inflight() {
     return 1
   fi
   return 0
+}
+
+telegram_e2e_healthy() {
+  [ "${CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE:-0}" = "1" ] && return 0
+  python3 - "$HEALTH_FILE" "${CLAUDE_TELE_HEALTH_MAX_AGE:-1200}" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+max_age = int(sys.argv[2])
+try:
+    health = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(health, dict):
+        raise ValueError("invalid health")
+except Exception:
+    raise SystemExit(1)
+now = int(time.time())
+def ts(key):
+    try:
+        return int(health.get(key) or 0)
+    except Exception:
+        return 0
+getme_ok = ts("last_getme_ok_at")
+polling_started = ts("polling_started_at")
+service_started = ts("service_started_at")
+if polling_started <= 0 or getme_ok <= 0 or now - getme_ok > max_age:
+    raise SystemExit(1)
+if service_started > 0 and polling_started < service_started:
+    raise SystemExit(1)
+if service_started > 0 and getme_ok < service_started:
+    raise SystemExit(1)
+if ts("last_getme_error_at") > getme_ok:
+    raise SystemExit(1)
+notify_ok = ts("last_mcp_notify_ok_at")
+notify_err = ts("last_mcp_notify_error_at")
+if notify_err > notify_ok:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
 }
 
 # ── Telegram getMe E2E probe (Obs-C) ───────────────────────────────────────
@@ -390,8 +433,40 @@ getme_probe() {
     | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - 2>/dev/null) || http_code="000"
 
   if [ "$http_code" = "200" ]; then
+    python3 - "$HEALTH_FILE" <<'PY' || true
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    current = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(current, dict):
+        current = {}
+except Exception:
+    current = {}
+current.update({"last_getme_ok_at": int(time.time()), "last_error": None, "updated_at": int(time.time())})
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+tmp.chmod(0o600)
+tmp.replace(path)
+PY
     return 0
   else
+    python3 - "$HEALTH_FILE" "$http_code" <<'PY' || true
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    current = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(current, dict):
+        current = {}
+except Exception:
+    current = {}
+current.update({"last_getme_error_at": int(time.time()), "last_error": f"getMe http {sys.argv[2]}", "updated_at": int(time.time())})
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+tmp.chmod(0o600)
+tmp.replace(path)
+PY
     logwarn "telegram getMe probe failed" "http_code=${http_code}"
     return 1
   fi

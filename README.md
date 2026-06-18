@@ -66,7 +66,7 @@ The Linux/macOS encryption key is stored in the same private state directory as 
 dog help       # friendly command menu
 dog setup      # guided setup or reconfiguration (--config-only writes config only)
 dog preflight  # check this machine is ready (Claude Code, deps, systemd)
-dog tell "status?" # send a note to the live Claude session without Telegram
+dog tell "status?" # send a health-gated local note to the live Claude session
 dog status     # service + bot status
 dog start      # start the bot
 dog stop       # stop the bot
@@ -76,7 +76,11 @@ dog logs       # logs; blocked in demo mode unless raw is requested
 dog uninstall  # remove service + binaries (--purge also removes config + token)
 ```
 
-`dog tell` is a local control channel into the existing Claude terminal. It pastes your note into the already-running tmux session and presses Enter. It does not start a second Telegram poller and it does not test Telegram delivery. Use it for quick steering or status checks; do not send secrets through it.
+`dog tell` is a local control channel into the existing Claude terminal. It pastes your note into the already-running tmux session and presses Enter. It does not start a second Telegram poller, but it is intentionally gated on fresh Telegram health so local injection cannot hide a broken Telegram path. Use it for quick steering or status checks; do not send secrets through it.
+
+Break-glass override: `CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE=1` disables that gate for local emergency recovery only. Prefer fixing Telegram health first; the override can reintroduce replay/injection loops if used casually.
+
+`dog start` enables and starts the user services so the bot remains always-on across user-service restarts.
 
 `dog` wraps an engine called `claude-tele`. Linux also exposes that engine directly for power users:
 
