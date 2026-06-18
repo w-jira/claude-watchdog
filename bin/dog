@@ -1,0 +1,491 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_DIR="${HOME}/.claude/channels/telegram"
+ENV_FILE="${STATE_DIR}/.env"
+ACCESS_FILE="${STATE_DIR}/access.json"
+TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
+TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
+HEALTH_FILE="${STATE_DIR}/plugin-health.json"
+
+SYSTEMD_DIR="${HOME}/.config/systemd/user"
+TMUX_SESSION="${CLAUDE_TELE_SESSION:-telegram-claude}"
+
+# --plain (also NO_COLOR, or a non-TTY stdout) disables color + ASCII art so
+# output stays clean over SSH, in CI, and in logs.
+PLAIN=0
+for _arg in "$@"; do
+  [ "$_arg" = "--plain" ] && PLAIN=1
+done
+[ -n "${NO_COLOR:-}" ] && PLAIN=1
+[ -n "${CI:-}" ] && PLAIN=1
+[ -t 1 ] || PLAIN=1
+if [ "$PLAIN" = "0" ]; then
+  BOLD=$'\e[1m'; BLUE=$'\e[34m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RED=$'\e[31m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+else
+  BOLD=""; BLUE=""; GREEN=""; YELLOW=""; RED=""; DIM=""; RESET=""
+fi
+
+# Drop leading global flags from positional args so command dispatch still works
+# without mutating command data such as `dog tell "use --plain"`.
+while [ "${1:-}" = "--plain" ]; do
+  shift
+done
+[ "$#" -gt 0 ] || set -- help
+
+log() { printf '%s\n' "$*"; }
+ok() { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%swarn:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+confirm() { printf '%s [y/N] ' "$1"; read -r ans; case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+miss() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*"; }
+
+banner() {
+  if [ "$PLAIN" = "1" ]; then printf 'claude-watchdog\n'; return; fi
+  printf '\n'
+  if command -v figlet >/dev/null 2>&1; then
+    printf '%s%s' "$BLUE" "$BOLD"
+    figlet -f standard WATCHDOG 2>/dev/null || figlet WATCHDOG
+    printf '%s' "$RESET"
+  else
+    printf '%s%s  W A T C H D O G%s\n' "$BLUE" "$BOLD" "$RESET"
+    printf '%s  ─────────────────────────────────────%s\n' "$BLUE" "$RESET"
+  fi
+  printf '%s  Claude Code on Telegram, always on.%s\n\n' "$DIM" "$RESET"
+}
+
+# dog is the friendly wrapper; claude-tele is the engine it drives.
+has_claude() { command -v claude >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/claude" ]; }
+
+# Best-effort login check. Returns 0 if credential markers are found; 1 means
+# "could not confirm" — NOT proof of being logged out, so callers warn (don't hard-fail) on 1.
+claude_auth_hint() {
+  local f
+  for f in "${HOME}/.claude/.credentials.json" "${HOME}/.config/claude/.credentials.json"; do
+    [ -s "$f" ] && return 0
+  done
+  [ -s "${HOME}/.claude.json" ] && grep -q '"oauthAccount"\|"account"\|"apiKey"' "${HOME}/.claude.json" 2>/dev/null && return 0
+  return 1
+}
+
+telegram_e2e_healthy() {
+  [ "${CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE:-0}" = "1" ] && return 0
+  python3 - "$HEALTH_FILE" "${CLAUDE_TELE_HEALTH_MAX_AGE:-1200}" <<'PY'
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+max_age = int(sys.argv[2])
+try:
+    health = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(health, dict):
+        raise ValueError("invalid health")
+except Exception:
+    raise SystemExit(1)
+now = int(time.time())
+def ts(key):
+    try:
+        return int(health.get(key) or 0)
+    except Exception:
+        return 0
+getme_ok = ts("last_getme_ok_at")
+polling_started = ts("polling_started_at")
+service_started = ts("service_started_at")
+if polling_started <= 0 or getme_ok <= 0 or now - getme_ok > max_age:
+    raise SystemExit(1)
+if service_started > 0 and polling_started < service_started:
+    raise SystemExit(1)
+if service_started > 0 and getme_ok < service_started:
+    raise SystemExit(1)
+if ts("last_getme_error_at") > getme_ok:
+    raise SystemExit(1)
+notify_ok = ts("last_mcp_notify_ok_at")
+notify_err = ts("last_mcp_notify_error_at")
+if notify_err > notify_ok:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+print_claude_install_help() {
+  cat >&2 <<'EOF'
+
+Claude Code is not installed. This tool never installs Node.js or Claude Code for you —
+install and authenticate it yourself first:
+
+  npm install -g @anthropic-ai/claude-code
+  claude            # then complete login
+
+Prefer a user-scoped install (no global npm writes)?
+  mkdir -p "$HOME/.npm-global"
+  npm install -g --prefix "$HOME/.npm-global" @anthropic-ai/claude-code
+  export PATH="$HOME/.npm-global/bin:$PATH"
+  claude
+
+Official docs: https://docs.anthropic.com/en/docs/claude-code
+
+Then re-run:
+  ./bin/dog setup
+EOF
+}
+
+# `dog preflight` — "can I set up?" (pre-install capability check).
+# Distinct from `dog doctor`, which checks the health of an already-running service.
+preflight() {
+  local hard=0
+  log "${BOLD}Preflight — checking this machine${RESET}"
+  case "$(uname -s)" in
+    Linux|Darwin) ok "OS $(uname -s)" ;;
+    *) miss "unsupported OS $(uname -s) (Linux/macOS only)"; hard=1 ;;
+  esac
+  local c
+  for c in tmux python3 openssl curl unzip git; do
+    if command -v "$c" >/dev/null 2>&1; then ok "$c"; else miss "$c — installer can add it (system deps)"; fi
+  done
+  if bun --version >/dev/null 2>&1; then ok "bun ($(bun --version 2>/dev/null))"; else miss "bun — installer can add a pinned, checksum-verified build"; fi
+  if [ "$(uname -s)" = "Linux" ]; then
+    if systemctl --user show-environment >/dev/null 2>&1; then ok "systemd --user"; else miss "systemd --user — required for the Linux service"; fi
+  fi
+  if has_claude; then
+    ok "Claude Code installed"
+    if claude_auth_hint; then ok "Claude Code appears authenticated"; else warn "Claude Code login not detected — run: claude (then complete login)"; fi
+  else
+    miss "Claude Code NOT installed (required)"
+    hard=1
+  fi
+  log ""
+  if [ "$hard" = "1" ]; then
+    has_claude || print_claude_install_help
+    warn "preflight found blockers above — resolve them, then re-run"
+    return 1
+  fi
+  ok "preflight passed"
+}
+
+cmd_tell() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required"
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null || die "Claude session not running; start it with: dog start"
+  telegram_e2e_healthy || die "Telegram E2E health is not fresh; refusing to inject into Claude session"
+
+  local message=""
+  if [ "$#" -gt 0 ]; then
+    message="$*"
+  elif [ ! -t 0 ]; then
+    message="$(cat)"
+  else
+    die "message required. Usage: dog tell \"status?\"  (or pipe text into dog tell)"
+  fi
+  [ -n "$message" ] || die "message is empty"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/dog-tell.XXXXXX")"
+  trap 'rm -f "$tmp"; trap - RETURN' RETURN
+  printf '%s\n' "$message" > "$tmp"
+  tmux load-buffer -t "$TMUX_SESSION" "$tmp"
+  tmux paste-buffer -t "$TMUX_SESSION"
+  tmux delete-buffer 2>/dev/null || true
+  tmux send-keys -t "$TMUX_SESSION" Enter
+  ok "sent to Claude session"
+}
+
+cmd_uninstall() {
+  local purge=0
+  for a in "$@"; do [ "$a" = "--purge" ] && purge=1; done
+  banner
+  log "${BOLD}Uninstall claude-watchdog${RESET}"
+  log "Removes the service + installed binaries from your home directory."
+  [ "$purge" = "1" ] && log "${YELLOW}--purge: also deletes config + token in ${STATE_DIR}${RESET}"
+  confirm "Proceed?" || die "aborted"
+
+  command -v "${HOME}/bin/claude-tele" >/dev/null 2>&1 && "${HOME}/bin/claude-tele" stop >/dev/null 2>&1 || true
+  case "$(uname -s)" in
+    Linux)
+      systemctl --user disable --now telegram-claude.service telegram-claude-watchdog.service 2>/dev/null || true
+      rm -f "${SYSTEMD_DIR}/telegram-claude.service" "${SYSTEMD_DIR}/telegram-claude-watchdog.service"
+      systemctl --user daemon-reload 2>/dev/null || true
+      ;;
+    Darwin)
+      for p in "${HOME}/Library/LaunchAgents/"*telegram-claude*.plist; do
+        [ -e "$p" ] || continue
+        launchctl unload "$p" 2>/dev/null || true
+        rm -f "$p"
+      done
+      ;;
+  esac
+  rm -f "${HOME}/bin/dog" "${HOME}/bin/claude-tele" "${HOME}/bin/claude-tele-watchdog" \
+        "${HOME}/bin/claude-tele-patch-telegram-plugin" "${HOME}/bin/claude-tele-replay-missed" \
+        "${HOME}/bin/claude-tele-control-mcp.py"
+  ok "removed service + binaries"
+  if [ "$purge" = "1" ]; then
+    rm -rf "$STATE_DIR"
+    ok "purged ${STATE_DIR}"
+  else
+    log "config preserved in ${STATE_DIR} (use: dog uninstall --purge to remove it)"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: dog <command> [--plain]
+
+Commands:
+  setup        Guided setup/reconfiguration. Reads the token hidden, encrypts it at rest.
+               Flag: --config-only  (write config, skip service install/start)
+  preflight    Check this machine is ready to set up (Claude Code, deps, systemd).
+  tell         Send a note to the live Claude session. Example: dog tell "status?"
+  uninstall    Remove the service + binaries. Flag: --purge (also delete config + token).
+  help         Show this menu.
+
+Daily use (these wrap the claude-tele engine):
+  dog status     Show bot status.
+  dog start      Start the bot service.
+  dog stop       Stop the bot service.
+  dog restart    Restart the bot service.
+  dog doctor     Run health diagnostics.
+  dog logs       Show logs (blocked in demo mode unless raw is requested).
+
+Global:
+  --plain        Disable color + ASCII banner (also honors NO_COLOR / CI / non-TTY).
+EOF
+}
+
+encrypt_token() {
+  local token="$1"
+  command -v openssl >/dev/null 2>&1 || return 1
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  if [ ! -s "$TOKEN_KEY_FILE" ]; then
+    openssl rand -base64 48 > "$TOKEN_KEY_FILE"
+    chmod 600 "$TOKEN_KEY_FILE"
+  fi
+  printf '%s' "$token" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${TOKEN_KEY_FILE}" -out "$TOKEN_ENC_FILE"
+  chmod 600 "$TOKEN_ENC_FILE"
+}
+
+write_env() {
+  local token="$1" mode="$2" demo="$3"
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  if encrypt_token "$token"; then
+    {
+      printf 'TELEGRAM_BOT_TOKEN_ENCRYPTED=1\n'
+      printf 'CLAUDE_PERMISSION_MODE=%s\n' "$mode"
+      printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$demo"
+    } > "$ENV_FILE"
+  else
+    warn "openssl not found; storing token in private plaintext .env instead of encrypted token file"
+    {
+      printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token"
+      printf 'CLAUDE_PERMISSION_MODE=%s\n' "$mode"
+      printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$demo"
+    } > "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE"
+}
+
+
+random_phrase() {
+  if command -v openssl >/dev/null 2>&1; then
+    printf 'dog-setup-%s\n' "$(openssl rand -hex 4)"
+  else
+    printf 'dog-setup-%s-%s\n' "$(date +%s)" "${RANDOM}"
+  fi
+}
+
+detect_telegram_user_id() {
+  local token="$1" phrase="$2"
+  command -v python3 >/dev/null 2>&1 || return 2
+  python3 -c '
+import json, re, sys, time, urllib.parse, urllib.request
+
+token = sys.stdin.readline().rstrip("\n")
+phrase = sys.stdin.readline().rstrip("\n")
+base = "https://api.telegram.org/bot" + token + "/getUpdates"
+deadline = time.time() + 60
+seen = set()
+while time.time() < deadline:
+    url = base + "?" + urllib.parse.urlencode({"timeout": 10, "allowed_updates": json.dumps(["message"])})
+    try:
+        with urllib.request.urlopen(url, timeout=15) as res:
+            payload = json.load(res)
+    except Exception:
+        time.sleep(2)
+        continue
+    for update in payload.get("result", []):
+        uid = update.get("update_id")
+        if uid in seen:
+            continue
+        seen.add(uid)
+        msg = update.get("message") or {}
+        if msg.get("text") != phrase:
+            continue
+        sender = msg.get("from") or {}
+        user_id = sender.get("id")
+        if not user_id:
+            continue
+        username = sender.get("username") or ""
+        first = sender.get("first_name") or ""
+        last = sender.get("last_name") or ""
+        full_name = (first + " " + last).strip()
+        if full_name and username:
+            label = f"{full_name} (@{username})"
+        elif full_name:
+            label = full_name
+        elif username:
+            label = f"@{username}"
+        else:
+            label = "unknown name"
+        label = re.sub(r"[\x00-\x1f\x7f]+", " ", label).strip() or "unknown name"
+        print("\t".join([str(user_id), label]))
+        raise SystemExit(0)
+    time.sleep(1)
+raise SystemExit(1)
+' <<EOF
+$token
+$phrase
+EOF
+}
+
+write_access() {
+  local user_id="$1"
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  {
+    printf '{\n'
+    printf '  "dmPolicy": "allowlist",\n'
+    printf '  "allowFrom": ["%s"],\n' "$user_id"
+    printf '  "groups": {},\n'
+    printf '  "pending": {},\n'
+    printf '  "ackReaction": "👀",\n'
+    printf '  "replyToMode": "first",\n'
+    printf '  "textChunkLimit": 4096,\n'
+    printf '  "chunkMode": "newline"\n'
+    printf '}\n'
+  } > "$ACCESS_FILE"
+  chmod 600 "$ACCESS_FILE"
+}
+
+choose_permission() {
+  log "" >&2
+  log "${BOLD}Claude permission level${RESET}" >&2
+  log "  1) default      Ask before tools (recommended for demos)" >&2
+  log "  2) plan         Read/plan first" >&2
+  log "  3) acceptEdits  Auto-accept file edits" >&2
+  log "  4) auto         Claude decides when to ask" >&2
+  log "  5) dontAsk      Less prompting" >&2
+  log "  6) bypass       No permission prompts; sandbox only" >&2
+  printf 'Choose [1-6] (default 1): ' >&2
+  read -r choice
+  case "${choice:-1}" in
+    1) printf 'default\n' ;;
+    2) printf 'plan\n' ;;
+    3) printf 'acceptEdits\n' ;;
+    4) printf 'auto\n' ;;
+    5) printf 'dontAsk\n' ;;
+    6) printf 'bypassPermissions\n' ;;
+    *) die "invalid permission choice: ${choice}" ;;
+  esac
+}
+
+cmd_setup() {
+  local installer=""
+  if [ -f "${ROOT}/config/env.example" ] && [ -f "${ROOT}/config/access.example.json" ]; then
+    case "$(uname -s)" in
+      Darwin) [ -f "${ROOT}/install-macos.sh" ] && installer="${ROOT}/install-macos.sh" ;;
+      Linux) [ -f "${ROOT}/install.sh" ] && installer="${ROOT}/install.sh" ;;
+      *) die "setup supports Linux/macOS; use install-windows.ps1 on Windows" ;;
+    esac
+  fi
+  local config_only=0
+  for a in "$@"; do [ "$a" = "--config-only" ] && config_only=1; done
+
+  banner
+  log "This wizard reads the bot token hidden and encrypts it at rest when OpenSSL is available."
+  log ""
+
+  # Preflight: Claude Code must be present (and ideally authenticated) before we
+  # collect any secrets. --config-only relaxes the hard gate for advanced users.
+  if ! has_claude; then
+    if [ "$config_only" = "1" ]; then
+      warn "Claude Code not installed — writing config only (--config-only). Install + authenticate it before starting."
+    else
+      print_claude_install_help
+      die "Claude Code is required before setup can continue"
+    fi
+  elif [ "$config_only" = "0" ] && ! claude_auth_hint; then
+    warn "Claude Code is installed but a login wasn't detected."
+    log "Open another terminal, run 'claude', and complete login." >&2
+    confirm "Have you completed Claude Code login?" || die "Run 'claude' to log in, then re-run: dog setup"
+  fi
+
+  printf 'Telegram bot token from BotFather: '
+  read -rs token
+  printf '\n'
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Telegram bot token should look like '<bot-id>:<secret>'"
+
+  user_id=""
+  if confirm "Auto-detect your Telegram user ID by sending a test message?"; then
+    phrase="$(random_phrase)"
+    log ""
+    log "Send this exact message to your bot, then wait here:"
+    log "${BOLD}${phrase}${RESET}"
+    log ""
+    found="$(detect_telegram_user_id "$token" "$phrase" || true)"
+    if [ -n "$found" ]; then
+      IFS=$'\t' read -r user_id label <<EOF
+$found
+EOF
+      log "Detected Telegram sender: ${label:-unknown name}"
+      log "Numeric Telegram user ID: ${user_id}"
+      if ! confirm "Use this Telegram account for the allowlist?"; then
+        user_id=""
+      fi
+    else
+      warn "no matching Telegram test message found; falling back to manual user ID"
+    fi
+  fi
+  if [ -z "$user_id" ]; then
+    printf 'Your numeric Telegram user ID: '
+    read -r user_id
+  fi
+  [[ "$user_id" =~ ^[0-9]+$ ]] || die "Telegram user ID must be numeric"
+
+  mode="$(choose_permission)"
+  demo=0
+  confirm "Enable demo mode to hide sensitive status/log details?" && demo=1
+  install_deps=0
+  start=0
+  if [ "$config_only" = "0" ]; then
+    confirm "Install missing system dependencies (Bun + OS packages via apt)? Never installs Node or Claude Code." && install_deps=1
+    confirm "Start after setup?" && start=1
+  fi
+
+  write_env "$token" "$mode" "$demo"
+  write_access "$user_id"
+  unset token
+  ok "wrote secure config files (${STATE_DIR}; token not printed)"
+
+  if [ "$config_only" = "1" ]; then
+    ok "config-only: skipped service install/start"
+    log "When ready, run ./bin/dog setup (without --config-only) to install + start the service."
+  elif [ -n "$installer" ]; then
+    args=(--yes --permission-mode "$mode")
+    [ "$demo" = "1" ] && args+=(--demo)
+    [ "$install_deps" = "1" ] && args+=(--install-deps)
+    [ "$start" = "1" ] && args+=(--start)
+    "$installer" "${args[@]}"
+  else
+    warn "installer assets not found; updated config only"
+    warn "for first-time install, run ./bin/dog setup from the cloned repo"
+  fi
+}
+
+case "${1:-help}" in
+  setup) cmd_setup "${@:2}" ;;
+  preflight) preflight ;;
+  tell) shift; cmd_tell "$@" ;;
+  uninstall) cmd_uninstall "${@:2}" ;;
+  status|start|stop|restart|doctor|logs) command -v claude-tele >/dev/null 2>&1 || die "the claude-tele engine isn't installed yet; run: dog setup"; claude-tele "$@" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command: $1" ;;
+esac

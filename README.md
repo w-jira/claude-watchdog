@@ -1,201 +1,196 @@
 # claude-watchdog
 
-One-stop installer and watchdog for running Claude Code as an always-on Telegram bot.
+Run Claude Code from Telegram without babysitting a terminal.
 
-`claude-watchdog` installs a user-systemd managed Claude Code Telegram session, keeps it alive, auto-compacts high-context sessions, and recovers common Telegram bridge failures.
+`claude-watchdog` sets up one always-on Claude Code session, connected through Anthropic's official Telegram plugin. It installs the service, keeps the bot alive, protects the setup flow from common token leaks, and gives you a small CLI for day-to-day operations.
 
-## What it does
+```bash
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+./bin/dog setup
+```
 
-- Runs one Claude Code Telegram channel in `tmux` + `systemd --user`.
-- Installs service files and helper scripts into the current user account.
-- Optionally installs supported dependencies like `tmux`, `curl`, `unzip`, `git`, and a pinned Bun release.
-- Keeps Telegram transcripts isolated in `~/.claude/channels/telegram/workdir`.
-- Prevents/reports missing Telegram plugin bridge (`bun`) failures.
-- Auto-compacts when context usage is high and Claude appears idle.
-- Journals allowed inbound Telegram messages before MCP delivery.
-- Replays journaled Telegram texts that are absent from Claude transcripts after restart.
-- Optional least-privilege MCP helper can request only `/compact`.
+After install:
+
+```bash
+dog status
+dog logs
+dog restart
+```
+
+## Why this exists
+
+Claude Code already has a Telegram plugin. The hard part is running it safely for more than five minutes.
+
+This repo handles the boring production bits:
+
+- one Telegram poller per bot token
+- automatic restart after crashes
+- isolated workdir so Telegram does not hijack your normal Claude session
+- secure setup wizard for bot token and allowlist config
+- demo mode that hides logs and local runtime details while you present
+- Linux watchdog support for health checks, missed-message replay, and context compaction
+
+## Recommended setup
+
+For the smoothest always-on setup, run this on a small Linux VM/VPS such as Ubuntu on AWS Lightsail, EC2, DigitalOcean, Hetzner, or similar. Cloud providers often offer introductory credits or free-tier trials for eligible accounts; terms change, so verify the current offer before relying on it.
+
+If you are new to servers, start with the beginner walkthrough:
+
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+
+Use the CLI wizard. It keeps the bot token out of shell history and command arguments.
+
+```bash
+git clone https://github.com/w-jira/claude-watchdog.git
+cd claude-watchdog
+./bin/dog setup
+```
+
+The wizard asks for:
+
+- Telegram bot token from BotFather
+- your Telegram user ID, which it can auto-detect by asking you to send a one-time test message to the bot
+- Claude permission mode
+- demo mode on/off
+- whether to install missing system dependencies (Bun + OS packages) — it never installs Node.js or Claude Code for you
+- whether to start the bot immediately
+
+By default, `dog setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
+
+The Linux/macOS encryption key is stored in the same private state directory as the encrypted token. This removes the token from `.env` and casual text exposure, but it does not protect against malware, a compromised OS account, or backups that include both `.token.enc` and `.token.key`.
+
+## Daily commands
+
+```bash
+dog help       # friendly command menu
+dog setup      # guided setup or reconfiguration (--config-only writes config only)
+dog preflight  # check this machine is ready (Claude Code, deps, systemd)
+dog tell "status?" # send a health-gated local note to the live Claude session
+dog status     # service + bot status
+dog start      # start the bot
+dog stop       # stop the bot
+dog restart    # restart the bot
+dog doctor     # diagnostics
+dog logs       # logs; blocked in demo mode unless raw is requested
+dog uninstall  # remove service + binaries (--purge also removes config + token)
+```
+
+`dog tell` is a local control channel into the existing Claude terminal. It pastes your note into the already-running tmux session and presses Enter. It does not start a second Telegram poller, but it is intentionally gated on fresh Telegram health so local injection cannot hide a broken Telegram path. Use it for quick steering or status checks; do not send secrets through it.
+
+Break-glass override: `CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE=1` disables that gate for local emergency recovery only. Prefer fixing Telegram health first; the override can reintroduce replay/injection loops if used casually.
+
+`dog start` enables and starts the user services so the bot remains always-on across user-service restarts.
+
+`dog` wraps an engine called `claude-tele`. Linux also exposes that engine directly for power users:
+
+```bash
+claude-tele compact --json
+claude-tele replay-missed --dry-run
+claude-tele attach
+```
+
+## Platform support
+
+- Linux: full support. Uses `systemd --user`, `tmux`, watchdog auto-heal, context compaction, and missed-message replay.
+- macOS: beta. Uses LaunchAgent and `tmux`. Supports setup, start/stop/restart, status, logs, attach, heal, and doctor. The full Linux watchdog is not implemented yet.
+- Windows native: beta. Uses PowerShell and a per-user Scheduled Task. Good for basic always-on operation. WSL2 is still the better Windows path if you want Linux-equivalent behavior.
 
 ## Requirements
 
-Required before the bot can run:
+Before the bot can run, you need:
 
-- Linux with `systemd --user`
-- Claude Code CLI installed and authenticated
-- Telegram bot token from BotFather
-- Your numeric Telegram user ID for the allowlist
+- Claude Code CLI installed and authenticated — you install it yourself (`npm install -g @anthropic-ai/claude-code`, then run `claude` to log in). `dog setup` checks for it and won't proceed without it; it never installs Node.js or Claude Code for you. See https://docs.anthropic.com/en/docs/claude-code
+- a Telegram bot token from BotFather
+- your Telegram user ID; `dog setup` can detect it automatically from a one-time test message
 
-The installer can handle these on Debian/Ubuntu when run with `--install-deps`:
+Linux full mode also needs `systemd --user`, plus `tmux`, `python3`, `git`, `openssl`, `curl`, and `unzip`. On Debian/Ubuntu, `dog setup` can install these system dependencies (and a pinned, checksum-verified Bun) when you approve it — but never Node.js or Claude Code.
 
-- `tmux`
-- `python3`
-- `curl`
-- `unzip`
-- `git`
-- `bun` pinned to `bun-v1.3.14` by default
+## Permissions
 
-Optional:
+The setup wizard lets you choose how much autonomy Claude gets:
 
-- `msmtp` for watchdog circuit-breaker email alerts
-- `mcp` Python package if you want to run `bin/claude-tele-control-mcp.py`
+- `default`: safest default; Claude asks before tools
+- `plan`: read and plan first
+- `acceptEdits`: accept file edits automatically
+- `auto`: let Claude decide when to ask
+- `dontAsk`: fewer prompts
+- `bypassPermissions`: no permission prompts; only use in a sandbox
 
-## Fast path
+For demos and shared machines, start with `default` plus demo mode.
 
-```bash
-git clone https://github.com/w-jira/claude-watchdog.git
-cd claude-watchdog
-TELEGRAM_BOT_TOKEN='replace-with-botfather-token' \
-TELEGRAM_USER_ID='123456789' \
-  ./install.sh --install-deps --start --yes
-```
+## Demo mode
 
-Then check:
+Demo mode reduces accidental disclosure while presenting.
 
-```bash
-claude-tele status
-claude-tele logs
-```
+It hides PIDs, local paths, and detailed runtime status. It also blocks logs unless you explicitly request raw output.
 
-## Agent-friendly setup
+Demo mode does not erase old transcripts or logs. If you already ran the bot with sensitive prompts, clean those separately before recording or presenting.
 
-If an AI agent is helping you install this, give it only these values:
+## Agentic setup
 
-- Telegram bot token
-- Telegram user ID
-- whether it may run `sudo apt-get install` for missing OS packages
+If another AI agent is installing this for you, do not paste secrets into a chat transcript unless you trust that environment.
 
-Recommended agent command:
+Use the dedicated agent setup guide instead:
+
+- [docs/AGENT_SETUP.md](docs/AGENT_SETUP.md)
+
+That file contains the non-interactive commands and the security caveats. The main path for humans is still `./bin/dog setup`.
+
+## Manual install commands
+
+Use these only when you need non-interactive setup or are building automation around the repo.
+
+Linux:
 
 ```bash
 TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
-  ./install.sh --install-deps --start --yes
+  ./install.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
-The installer is idempotent: re-running it updates scripts/services and preserves existing config unless token/user ID are explicitly provided.
-
-## Manual setup
+macOS:
 
 ```bash
-git clone https://github.com/w-jira/claude-watchdog.git
-cd claude-watchdog
-./install.sh
+TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
+  ./install-macos.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
-Then edit:
+Windows PowerShell:
 
-```bash
-nano ~/.claude/channels/telegram/.env
-nano ~/.claude/channels/telegram/access.json
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "<bot-token>"
+$env:TELEGRAM_USER_ID = "<telegram-user-id>"
+.\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
 ```
 
-Example `.env`:
+These paths are useful for agents and CI, but they are less safe for humans because tokens can land in shell history or process environments. Prefer `dog setup` when you are at a terminal.
 
-```bash
-TELEGRAM_BOT_TOKEN=replace-with-botfather-token
-```
+## Security model
 
-Example `access.json`:
+`claude-watchdog` is designed to avoid the easy mistakes:
 
-```json
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["123456789"],
-  "groups": {},
-  "pending": {},
-  "ackReaction": "👀",
-  "replyToMode": "first",
-  "textChunkLimit": 4096,
-  "chunkMode": "newline"
-}
-```
+- token input is hidden in the setup wizard
+- token is not passed to child installers as an argument
+- generated config files are private (`0600` on Linux/macOS, restricted ACLs on Windows)
+- `dog setup` encrypts the bot token at rest when OpenSSL is available
+- Linux/macOS keep the token encryption key next to the encrypted token, so OS-account security still matters
+- `.env` is parsed as data, never sourced or evaluated
+- Telegram access is allowlisted by user ID
+- the Claude session runs from an isolated workdir
 
-Start it:
+This is not a substitute for OS account security. A process running as your user can generally read your files and process environment. Use a dedicated Telegram bot token and rotate it if it may have been exposed.
 
-```bash
-claude-tele doctor
-claude-tele start
-claude-tele status
-```
-
-## Installer options
-
-```bash
-./install.sh --help
-```
-
-Options:
-
-- `--install-deps`: install missing supported dependencies.
-- `--token TOKEN`: write Telegram bot token.
-- `--telegram-user-id ID`: write allowlist config.
-- `--start`: start the bot after install.
-- `--yes`: non-interactive yes for supported install steps.
-
-## Commands
-
-```bash
-claude-tele start
-claude-tele stop
-claude-tele restart
-claude-tele status
-claude-tele attach
-claude-tele logs [-f]
-claude-tele heal
-claude-tele compact [--json] [--force]
-claude-tele replay-missed [--dry-run]
-claude-tele doctor
-```
-
-## No GitHub login on the VM
-
-Public HTTPS clone needs no GitHub login:
-
-```bash
-git clone https://github.com/w-jira/claude-watchdog.git
-```
-
-Or avoid GitHub entirely by copying a tarball over SSH:
-
-```bash
-tar -czf claude-watchdog.tar.gz claude-watchdog
-scp claude-watchdog.tar.gz user@your-vm:~/
-ssh user@your-vm 'tar -xzf claude-watchdog.tar.gz && cd claude-watchdog && ./install.sh'
-```
-
-## Safety rules
-
-- Never run another `claude --channels plugin:telegram@claude-plugins-official` poller with the same bot token.
-- Do not commit `.env`, `access.json`, transcripts, `inbox/`, PID/lock files, or Claude plugin cache contents.
-- Keep the service `WorkingDirectory` stable unless intentionally starting a new transcript lineage.
-- Use a dedicated Telegram bot token for this service.
-
-## Watchdog tuning
-
-Edit `~/.config/systemd/user/telegram-claude-watchdog.service`, then run:
-
-```bash
-systemctl --user daemon-reload
-claude-tele restart
-```
-
-Useful environment variables:
-
-```ini
-Environment=WATCHDOG_THRESHOLD=40
-Environment=WATCHDOG_INTERVAL=300
-Environment=WATCHDOG_GETME_EVERY=3
-Environment=WATCHDOG_WARMUP=60
-Environment=WATCHDOG_ALERT_EMAIL=you@example.com
-Environment=WATCHDOG_ALERT_FROM=claude-tele-watchdog@example.com
-Environment=WATCHDOG_MSMTP_ACCOUNT=default
-```
-
-Email alerts are disabled unless `WATCHDOG_ALERT_EMAIL` is set.
-
-## Validation
+## Validate changes
 
 ```bash
 ./tests/validate.sh
 ```
 
-This checks shell syntax, Python syntax, user-systemd unit validity, and common secret/personal-infra leaks.
+Validation checks shell syntax, Python syntax, user-systemd unit validity, and common public-release leaks.
+
+## Safety rules
+
+- Run only one poller per Telegram bot token.
+- Do not commit `.env`, `.token.enc`, `.token.key`, `access.json`, transcripts, inbox files, PID files, locks, or plugin cache contents.
+- Keep the Telegram workdir stable unless you intentionally want a new transcript lineage.
+- Use `dog doctor` before debugging a failed install.

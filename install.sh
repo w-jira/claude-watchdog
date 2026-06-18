@@ -5,10 +5,17 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="${HOME}/.claude/channels/telegram"
 WORKDIR="${STATE_DIR}/workdir"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
+TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
+TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 BUN_VERSION="${BUN_VERSION:-bun-v1.3.14}"
 INSTALL_DEPS=0
+INSTALL_CLAUDE=0
 START_SERVICE=0
 YES=0
+CLAUDE_INSTALLED_THIS_RUN=0
+MENU=0
+DEMO_MODE="${CLAUDE_WATCHDOG_DEMO:-0}"
+PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}"
 
@@ -19,9 +26,13 @@ Usage: ./install.sh [options]
 One-stop installer for claude-watchdog.
 
 Options:
-  --install-deps              Install missing OS/user deps where supported.
+  --install-deps              Install missing system deps (apt packages + pinned Bun). Never Node/Claude Code.
+  --install-claude            Explicitly install Claude Code via npm (off by default; you still log in yourself).
   --token TOKEN               Write Telegram bot token to ~/.claude/channels/telegram/.env.
   --telegram-user-id ID       Allow this Telegram user ID in access.json.
+  --permission-mode MODE       Claude permission mode: default, plan, acceptEdits, auto, dontAsk, bypassPermissions.
+  --demo                      Hide sensitive status/log details for demos.
+  --menu                      Run the interactive setup wizard (same as ./bin/dog setup).
   --start                     Start the systemd user service after install.
   -y, --yes                   Non-interactive yes for supported install steps.
   -h, --help                  Show this help.
@@ -31,19 +42,24 @@ Agent-friendly example:
     ./install.sh --install-deps --start --yes
 
 Notes:
-  - Claude Code CLI must be installed and authenticated before the bot can run.
+  - Claude Code is NOT installed by default. Install + authenticate it yourself, or
+    pass --install-claude to install it via npm into ~/.npm-global (you still log in).
   - If bun is missing and --install-deps is set, this installs a pinned Bun release
-    into ~/.bun/bin and symlinks it into ~/bin.
+    into ~/.bun/bin (verified against the published SHA256SUMS) and symlinks it into ~/bin.
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --install-deps) INSTALL_DEPS=1 ;;
+    --install-claude) INSTALL_CLAUDE=1 ;;
     --start) START_SERVICE=1 ;;
+    --menu) MENU=1 ;;
+    --demo) DEMO_MODE=1 ;;
     -y|--yes) YES=1 ;;
     --token) shift; BOT_TOKEN="${1:-}" ;;
     --telegram-user-id) shift; TELEGRAM_USER_ID="${1:-}" ;;
+    --permission-mode) shift; PERMISSION_MODE="${1:-}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -63,6 +79,14 @@ confirm() {
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
+validate_permission_mode() {
+  case "$PERMISSION_MODE" in
+    default|plan|acceptEdits|auto|dontAsk|bypassPermissions) return 0 ;;
+    *) die "invalid permission mode: ${PERMISSION_MODE}" ;;
+  esac
+}
+
+
 install_apt_deps() {
   local missing=()
   for cmd in tmux python3 curl unzip git; do
@@ -76,7 +100,10 @@ install_apt_deps() {
 }
 
 install_bun() {
-  if has bun; then
+  # Verify bun actually *runs*, not just that it's on PATH. A bun built for a
+  # CPU feature this host lacks (e.g. AVX2) is present but crashes with SIGILL,
+  # so `has bun` would wrongly skip the (re)install. `bun --version` catches it.
+  if bun --version >/dev/null 2>&1; then
     return 0
   fi
   [ "$INSTALL_DEPS" = "1" ] || return 0
@@ -85,7 +112,17 @@ install_bun() {
 
   local arch asset tmp zipdir
   case "$(uname -m)" in
-    x86_64|amd64) arch="x64" ;;
+    x86_64|amd64)
+      # The default bun x64 build requires AVX2. VirtualBox/QEMU guests, older
+      # CPUs, and some cloud instances lack it — there, bun SIGILLs on every
+      # invocation and the Telegram bridge silently never starts. Fall back to
+      # the baseline build (no AVX2 required) when AVX2 is absent.
+      if grep -qm1 avx2 /proc/cpuinfo 2>/dev/null; then
+        arch="x64"
+      else
+        arch="x64-baseline"
+        log "CPU has no AVX2 — using bun baseline build (bun-linux-x64-baseline)"
+      fi ;;
     aarch64|arm64) arch="aarch64" ;;
     *) die "unsupported architecture for bundled bun install: $(uname -m)" ;;
   esac
@@ -97,6 +134,19 @@ install_bun() {
   curl -fL --proto '=https' --tlsv1.2 \
     "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/${asset}" \
     -o "${tmp}/${asset}"
+  # Supply-chain: verify the download against the release's published SHA256SUMS
+  # before unzipping/executing it. HTTPS alone doesn't protect against a swapped
+  # or tampered release asset.
+  if has sha256sum; then
+    curl -fL --proto '=https' --tlsv1.2 \
+      "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/SHASUMS256.txt" \
+      -o "${tmp}/SHASUMS256.txt"
+    ( cd "$tmp" && grep -E "  ${asset}\$" SHASUMS256.txt | sha256sum -c - ) \
+      || die "bun checksum verification failed for ${asset} — refusing to install"
+    log "verified ${asset} against published SHA256SUMS"
+  else
+    warn "sha256sum not found — cannot verify bun download integrity; proceeding"
+  fi
   unzip -q "${tmp}/${asset}" -d "$tmp"
   zipdir="${tmp}/bun-linux-${arch}"
   install -d -m 700 "${HOME}/.bun/bin" "${HOME}/bin"
@@ -104,19 +154,129 @@ install_bun() {
   ln -sfn "${HOME}/.bun/bin/bun" "${HOME}/bin/bun"
 }
 
+install_claude_code() {
+  if has claude || [ -x "${HOME}/.local/bin/claude" ]; then
+    return 0
+  fi
+  [ "$INSTALL_CLAUDE" = "1" ] || return 0
+  if ! has npm; then
+    warn "npm is missing; install a current Node.js LTS/npm, then re-run with --install-claude"
+    return 0
+  fi
+
+  install -d -m 755 "${HOME}/.npm-global/bin" "${HOME}/.local/bin"
+  export PATH="${HOME}/.npm-global/bin:${PATH}"
+  log "installing Claude Code CLI with npm into ~/.npm-global"
+  npm install -g --prefix "${HOME}/.npm-global" @anthropic-ai/claude-code
+  if [ -x "${HOME}/.npm-global/bin/claude" ]; then
+    ln -sfn "${HOME}/.npm-global/bin/claude" "${HOME}/.local/bin/claude"
+    log "linked ${HOME}/.local/bin/claude -> ${HOME}/.npm-global/bin/claude"
+    CLAUDE_INSTALLED_THIS_RUN=1
+  fi
+}
+
+ensure_claude_symlink() {
+  # claude-tele expects ${HOME}/.local/bin/claude (also on the service's PATH).
+  # Many installs place claude at /usr/local/bin or behind a version manager,
+  # which makes the hardcoded path — and the service — fail to find it. Symlink
+  # the resolved binary so both the expected path and the service PATH work.
+  [ -x "${HOME}/.local/bin/claude" ] && return 0
+  local resolved
+  resolved="$(command -v claude 2>/dev/null || true)"
+  [ -n "$resolved" ] || return 0
+  install -d -m 755 "${HOME}/.local/bin"
+  ln -sfn "$resolved" "${HOME}/.local/bin/claude"
+  log "linked ${HOME}/.local/bin/claude -> ${resolved}"
+}
+
+plugin_installed() {
+  compgen -G "${HOME}/.claude/plugins/cache/*/telegram" >/dev/null
+}
+
+install_plugin() {
+  # The Telegram channel depends on the official telegram plugin. Without this
+  # the bridge silently never starts on a clean machine. Idempotent: both the
+  # marketplace add and the install are safe to repeat.
+  local claude_bin
+  claude_bin="$(command -v claude 2>/dev/null || true)"
+  if [ -z "$claude_bin" ] && [ -x "${HOME}/.local/bin/claude" ]; then
+    claude_bin="${HOME}/.local/bin/claude"
+  fi
+  [ -n "$claude_bin" ] || { warn "claude not found; skipping telegram plugin install — install/authenticate Claude Code, then re-run"; return 0; }
+
+  "$claude_bin" plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 || true
+  if "$claude_bin" plugin install telegram@claude-plugins-official >/dev/null 2>&1 || plugin_installed; then
+    log "installed plugin telegram@claude-plugins-official"
+  else
+    warn "could not auto-install the telegram plugin — run: claude to authenticate, then run: claude plugin install telegram@claude-plugins-official"
+  fi
+}
+
+set_env_key() {
+  local key="$1" value="$2" file="${STATE_DIR}/.env" tmp
+  tmp="$(mktemp)"
+  if [ -f "$file" ]; then
+    grep -v "^${key}=" "$file" > "$tmp" || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  install -m 600 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+encrypt_token() {
+  local token="$1"
+  has openssl || return 1
+  install -d -m 700 "$STATE_DIR"
+  umask 077
+  if [ ! -s "$TOKEN_KEY_FILE" ]; then
+    openssl rand -base64 48 > "$TOKEN_KEY_FILE"
+    chmod 600 "$TOKEN_KEY_FILE"
+  fi
+  printf '%s' "$token" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${TOKEN_KEY_FILE}" -out "$TOKEN_ENC_FILE"
+  chmod 600 "$TOKEN_ENC_FILE"
+}
+
+remove_legacy_cwd() {
+  local legacy="${HOME}/bin/cwd"
+  [ -e "$legacy" ] || return 0
+  if [ -f "$legacy" ] && grep -q "claude-watchdog setup" "$legacy" 2>/dev/null; then
+    rm -f "$legacy"
+    log "removed legacy ${legacy}; use dog instead"
+  else
+    warn "legacy ${legacy} exists but was not recognized as claude-watchdog; leaving it untouched"
+  fi
+}
+
 write_env() {
+  validate_permission_mode
   if [ -n "$BOT_TOKEN" ]; then
-    case "$BOT_TOKEN" in
-      *:*) ;;
-      *) die "Telegram bot token should look like '<bot-id>:<secret>'" ;;
-    esac
+    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Telegram bot token should look like '<bot-id>:<secret>'"
     umask 077
-    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN" > "${STATE_DIR}/.env"
+    if encrypt_token "$BOT_TOKEN"; then
+      {
+        printf 'TELEGRAM_BOT_TOKEN_ENCRYPTED=1\n'
+        printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
+        printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
+      } > "${STATE_DIR}/.env"
+      log "wrote encrypted token and ${STATE_DIR}/.env"
+    else
+      warn "openssl not found; storing token in private plaintext .env instead of encrypted token file"
+      {
+        printf 'TELEGRAM_BOT_TOKEN=%s\n' "$BOT_TOKEN"
+        printf 'CLAUDE_PERMISSION_MODE=%s\n' "$PERMISSION_MODE"
+        printf 'CLAUDE_WATCHDOG_DEMO=%s\n' "$DEMO_MODE"
+      } > "${STATE_DIR}/.env"
+      log "wrote ${STATE_DIR}/.env"
+    fi
     chmod 600 "${STATE_DIR}/.env"
-    log "wrote ${STATE_DIR}/.env"
   elif [ ! -f "${STATE_DIR}/.env" ]; then
     install -m 600 "${ROOT}/config/env.example" "${STATE_DIR}/.env"
+    set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
+    set_env_key "CLAUDE_WATCHDOG_DEMO" "$DEMO_MODE"
     warn "created ${STATE_DIR}/.env — edit TELEGRAM_BOT_TOKEN before starting"
+  else
+    set_env_key "CLAUDE_PERMISSION_MODE" "$PERMISSION_MODE"
+    set_env_key "CLAUDE_WATCHDOG_DEMO" "$DEMO_MODE"
   fi
 }
 
@@ -148,21 +308,32 @@ PY
   fi
 }
 
+[ "$MENU" = "1" ] && exec "${ROOT}/bin/dog" setup
+
 if [ "$INSTALL_DEPS" = "1" ]; then
   install_apt_deps
   install_bun
 fi
+# Claude Code is decoupled from --install-deps: only installed on explicit opt-in.
+if [ "$INSTALL_CLAUDE" = "1" ]; then
+  install_claude_code
+fi
 
-mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}"
+mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}" "${HOME}/.npm-global"
 chmod 700 "${STATE_DIR}" "${WORKDIR}"
 
 install -m 700 "${ROOT}/bin/claude-tele" "${HOME}/bin/claude-tele"
+install -m 700 "${ROOT}/bin/dog" "${HOME}/bin/dog"
+remove_legacy_cwd
 install -m 700 "${ROOT}/bin/claude-tele-watchdog" "${HOME}/bin/claude-tele-watchdog"
 install -m 700 "${ROOT}/bin/claude-tele-patch-telegram-plugin" "${HOME}/bin/claude-tele-patch-telegram-plugin"
 install -m 700 "${ROOT}/bin/claude-tele-replay-missed" "${HOME}/bin/claude-tele-replay-missed"
 install -m 700 "${ROOT}/bin/claude-tele-control-mcp.py" "${HOME}/bin/claude-tele-control-mcp.py"
 install -m 600 "${ROOT}/systemd/user/telegram-claude.service" "${SYSTEMD_DIR}/telegram-claude.service"
 install -m 600 "${ROOT}/systemd/user/telegram-claude-watchdog.service" "${SYSTEMD_DIR}/telegram-claude-watchdog.service"
+
+ensure_claude_symlink
+install_plugin
 
 write_env
 write_access
@@ -176,16 +347,22 @@ for cmd in claude tmux python3 systemctl bun; do
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   warn "missing commands: ${missing[*]}"
-  warn "run again with --install-deps for supported deps; install/authenticate Claude Code separately"
+  warn "run again with --install-deps for supported deps; authenticate Claude Code separately after install"
+fi
+
+if [ "$START_SERVICE" = "1" ] && [ "$CLAUDE_INSTALLED_THIS_RUN" = "1" ]; then
+  warn "Claude Code was installed during this setup; run claude to authenticate, then run: dog start"
+  START_SERVICE=0
 fi
 
 if [ "$START_SERVICE" = "1" ]; then
-  has claude || die "claude CLI is missing; install and authenticate it before --start"
+  has claude || [ -x "${HOME}/.local/bin/claude" ] || die "claude CLI is missing; install and authenticate it before --start"
+  plugin_installed || die "telegram plugin is not installed; run claude to authenticate, then run: claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install telegram@claude-plugins-official"
   [ -s "${STATE_DIR}/.env" ] || die "missing ${STATE_DIR}/.env"
   [ -s "${STATE_DIR}/access.json" ] || die "missing ${STATE_DIR}/access.json"
   "${HOME}/bin/claude-tele" start
 fi
 
 log "installed"
-log "next: claude-tele doctor"
-[ "$START_SERVICE" = "1" ] || log "then: claude-tele start"
+log "next: dog doctor"
+[ "$START_SERVICE" = "1" ] || log "then: dog start"
