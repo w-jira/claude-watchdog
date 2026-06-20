@@ -70,3 +70,10 @@ def test_bootstrap_refuses_non_git_install_dir(tmp_path):
 
     assert result.returncode != 0
     assert "exists but is not a git checkout" in result.stderr
+
+
+def test_bootstrap_reconnects_setup_stdin_to_tty_when_available():
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert "exec ./bin/dog setup </dev/tty" in text
+    assert "[ -r /dev/tty ] && [ -w /dev/tty ]" in text

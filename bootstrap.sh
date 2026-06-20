@@ -37,4 +37,7 @@ if [ "$SKIP_SETUP" = "1" ]; then
 fi
 
 log "starting guided setup"
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  exec ./bin/dog setup </dev/tty
+fi
 exec ./bin/dog setup
