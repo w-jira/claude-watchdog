@@ -2,7 +2,7 @@
 
 Run Claude Code from Telegram without babysitting a terminal.
 
-`claude-watchdog` sets up one always-on Claude Code session, connected through Anthropic's official Telegram plugin. It installs the service, keeps the bot alive, protects the setup flow from common token leaks, and gives you a small CLI for day-to-day operations.
+`claude-watchdog` sets up one always-on Claude Code session, connected through Anthropic's official Telegram plugin. It installs the service, keeps your Claude session alive, auto-heals when it breaks, protects setup from common token leaks, and gives you a small CLI for day-to-day operations.
 
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git
@@ -24,12 +24,15 @@ Claude Code already has a Telegram plugin. The hard part is running it safely fo
 
 This repo handles the boring production bits:
 
-- one Telegram poller per bot token
-- automatic restart after crashes
-- isolated workdir so Telegram does not hijack your normal Claude session
-- secure setup wizard for bot token and allowlist config
-- demo mode that hides logs and local runtime details while you present
-- Linux watchdog support for health checks, missed-message replay, and context compaction
+- keeps one private Claude Code session running from Telegram
+- keeps your Claude session alive and auto-heals when it breaks
+- checks the common stuff that causes silent failures:
+  - Claude Code is installed and logged in
+  - the Telegram plugin and Bun bridge are working
+  - the bot token, allowlist, and Telegram health checks are fresh
+- catches up missed Telegram messages after a bridge hiccup, once Telegram health is proven again
+- isolates Telegram work from your normal Claude session
+- gives you a secure setup wizard, demo-safe output, and simple `dog` commands
 
 ## Recommended setup
 
@@ -76,9 +79,9 @@ dog logs       # logs; blocked in demo mode unless raw is requested
 dog uninstall  # remove service + binaries (--purge also removes config + token)
 ```
 
-`dog tell` is a local control channel into the existing Claude terminal. It pastes your note into the already-running tmux session and presses Enter. It does not start a second Telegram poller, but it is intentionally gated on fresh Telegram health so local injection cannot hide a broken Telegram path. Use it for quick steering or status checks; do not send secrets through it.
+`dog tell` sends a quick local note to the already-running Claude session. Use it for quick steering, status checks, or handoffs from another local agent. For example, you can tell Hermes, OpenClaw, or a shell script to run `dog tell "check status"` without starting a second Telegram bot connection. It is intentionally gated on fresh Telegram health so local control does not hide a broken Telegram path. Do not send secrets through it.
 
-Break-glass override: `CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE=1` disables that gate for local emergency recovery only. Prefer fixing Telegram health first; the override can reintroduce replay/injection loops if used casually.
+Break-glass override: `CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE=1` disables that gate for local emergency recovery only. Prefer fixing Telegram health first; the override can reintroduce replay/local-control loops if used casually.
 
 `dog start` enables and starts the user services so the bot remains always-on across user-service restarts.
 
