@@ -8,7 +8,7 @@ python3 -m py_compile \
   bin/claude-tele-patch-telegram-plugin \
   bin/claude-tele-replay-missed \
   bin/claude-tele-control-mcp.py
-python3 -m pytest tests/test_replay_health_gate.py tests/test_bootstrap.py tests/test_npm_package.py -q
+python3 -m pytest tests/test_replay_health_gate.py tests/test_bootstrap.py tests/test_npm_package.py tests/test_claude_tele_tmux_env.py -q
 tmp_units="$(mktemp -d)"
 trap 'rm -rf "$tmp_units"' EXIT
 python3 - "$tmp_units" <<'PY'

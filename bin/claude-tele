@@ -81,6 +81,7 @@ info() { echo "${BLUE}→${RESET} $*"; }
 
 # ── Preflight ──────────────────────────────────────────────────────────────
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+tmux_cmd() { env -u TMUX tmux "$@"; }
 
 # Read simple KEY=value settings from the bot .env without eval/source.
 env_value() {
@@ -127,7 +128,7 @@ mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 # ── Health predicates ──────────────────────────────────────────────────────
 svc_active()     { systemctl --user is-active --quiet "$SERVICE"; }
 wd_active()      { systemctl --user is-active --quiet "$WATCHDOG_SERVICE"; }
-session_exists() { tmux has-session -t "$SESSION" 2>/dev/null; }
+session_exists() { tmux_cmd has-session -t "$SESSION" 2>/dev/null; }
 
 # [H-3] bun_alive: trust the plugin's own bot.pid. Fall back to `pgrep -x bun`
 # + anchored cmdline match, not a bare `pgrep -f substring` which false-matches
@@ -153,7 +154,7 @@ bun_alive() {
 }
 
 capture_pane() {
-  tmux capture-pane -t "$SESSION" -p -S -30 2>/dev/null || true
+  tmux_cmd capture-pane -t "$SESSION" -p -S -30 2>/dev/null || true
 }
 
 extract_pct() {
@@ -249,7 +250,7 @@ workdir_transcript_glob() {
 resolve_claude_pid() {
   session_exists || return 1
   local pane_pid
-  pane_pid=$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
+  pane_pid=$(tmux_cmd list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
   [ -n "$pane_pid" ] || return 1
   # BFS through descendants, bail at first comm=="claude".
   local frontier="$pane_pid" next="" depth=0
@@ -282,7 +283,7 @@ cmd_exec_start() {
 
   if session_exists; then
     warn "stale tmux session '${SESSION}' — killing"
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux_cmd kill-session -t "$SESSION" 2>/dev/null || true
   fi
 
   mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR"
@@ -338,7 +339,7 @@ PY
     fi
   fi
 
-  # Build argv + shell-escape with printf %q. tmux new-session -c sets the
+  # Build argv + shell-escape with printf %q. tmux_cmd new-session -c sets the
   # session's cwd to our isolated workdir.
   local mode token
   mode="$(permission_mode)"
@@ -354,7 +355,7 @@ PY
   argv+=(--channels "plugin:telegram@claude-plugins-official")
   local cmd_str
   printf -v cmd_str '%q ' "${argv[@]}"
-  TELEGRAM_BOT_TOKEN="$token" tmux new-session -d -s "$SESSION" -c "$WORKDIR" -- "$cmd_str"
+  TELEGRAM_BOT_TOKEN="$token" tmux_cmd new-session -d -s "$SESSION" -c "$WORKDIR" -- "$cmd_str"
   unset token
 
   # [M-8] Poll the pane for first-run prompts rather than magic-sleeping.
@@ -373,10 +374,10 @@ PY
   local i trust_done=0 bypass_done=0
   for i in $(seq 1 60); do
     local pane
-    pane=$(tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null || true)
+    pane=$(tmux_cmd capture-pane -t "$SESSION" -p -S -40 2>/dev/null || true)
     if [ "$trust_done" = 0 ] && \
        printf '%s\n' "$pane" | grep -qE "trust the files|trust this folder|Is this a project you created"; then
-      tmux send-keys -t "$SESSION" -- Enter   # default option = trust this folder
+      tmux_cmd send-keys -t "$SESSION" -- Enter   # default option = trust this folder
       echo "folder-trust prompt accepted"
       trust_done=1
       sleep 1
@@ -385,9 +386,9 @@ PY
     if [ "$bypass_done" = 0 ] && \
        printf '%s\n' "$pane" | grep -q "Bypass Permissions mode"; then
       # Default is "No, exit"; select option 2 "Yes, I accept", then confirm.
-      tmux send-keys -t "$SESSION" -- "2"
+      tmux_cmd send-keys -t "$SESSION" -- "2"
       sleep 1
-      tmux send-keys -t "$SESSION" -- Enter
+      tmux_cmd send-keys -t "$SESSION" -- Enter
       echo "bypass-permissions prompt accepted"
       bypass_done=1
       sleep 1
@@ -435,9 +436,9 @@ cmd_exec_stop() {
     kill -INT "$cpid" 2>/dev/null || true
   else
     # Fallback: double-tap C-c into tmux with a brief gap.
-    tmux send-keys -t "$SESSION" -- C-c 2>/dev/null || true
+    tmux_cmd send-keys -t "$SESSION" -- C-c 2>/dev/null || true
     sleep 0.2
-    tmux send-keys -t "$SESSION" -- C-c 2>/dev/null || true
+    tmux_cmd send-keys -t "$SESSION" -- C-c 2>/dev/null || true
   fi
 
   # Wait up to 10s for graceful shutdown (transcript flush).
@@ -449,7 +450,7 @@ cmd_exec_stop() {
 
   if session_exists; then
     warn "session did not exit after 10s — force-killing tmux session"
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux_cmd kill-session -t "$SESSION" 2>/dev/null || true
     sleep 1
   fi
 
@@ -542,7 +543,7 @@ cmd_status() {
     fi
 
     local pane pct
-    pane=$(tmux capture-pane -t "$SESSION" -p -S -15 2>/dev/null) || pane=""
+    pane=$(tmux_cmd capture-pane -t "$SESSION" -p -S -15 2>/dev/null) || pane=""
     pct=$(printf '%s\n' "$pane" | grep -aE '[█▌░]' | grep -oE '[0-9]{1,3}%' | tail -1) || pct=""
     [ -n "$pct" ] && ok "context:  ${pct}"
   fi
@@ -564,7 +565,7 @@ cmd_status() {
 
 cmd_attach() {
   session_exists || die "session not running · start with: claude-tele start"
-  exec tmux attach -t "$SESSION"
+  exec env -u TMUX tmux attach -t "$SESSION"
 }
 
 # [L-11] Pass follow as a proper array element, not a quoted-empty-string arg.
@@ -664,7 +665,7 @@ cmd_compact() {
 
   date +%s > "$COMPACT_INFLIGHT"
   date +%s > "$WATCHDOG_STATE_FILE"
-  tmux send-keys -t "$SESSION" -- "/compact" Enter
+  tmux_cmd send-keys -t "$SESSION" -- "/compact" Enter
   (
     sleep "$COMPACT_SENTINEL_TTL"
     rm -f "$COMPACT_INFLIGHT"
