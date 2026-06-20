@@ -17,6 +17,8 @@
   },
   "files": [
     "bin/",
+    "!bin/__pycache__/",
+    "!**/*.pyc",
     "config/",
     "systemd/",
     "install.sh",

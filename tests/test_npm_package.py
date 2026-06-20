@@ -33,6 +33,8 @@ def test_package_json_exposes_dog_cli_without_install_scripts():
     assert "postinstall" not in pkg.get("scripts", {})
     assert pkg["files"] == [
         "bin/",
+        "!bin/__pycache__/",
+        "!**/*.pyc",
         "config/",
         "systemd/",
         "install.sh",
@@ -69,8 +71,10 @@ def test_npm_pack_contains_runtime_assets_and_no_runtime_state(tmp_path):
         ".env",
         ".token.enc",
         ".token.key",
+        ".pyc",
         "access.json",
         "inbound-journal.jsonl",
         "replayed-inbound.jsonl",
     )
     assert not any(name.endswith(forbidden_suffixes) for name in names)
+    assert not any("__pycache__" in name for name in names)
