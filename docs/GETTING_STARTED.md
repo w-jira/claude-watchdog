@@ -60,7 +60,8 @@ Official Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 Fast path, from any directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh | bash
+curl -fsSLo /tmp/claude-watchdog-bootstrap.sh https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh
+bash /tmp/claude-watchdog-bootstrap.sh
 ```
 
 That clones or updates the repo under `~/.local/share/claude-watchdog/repo`, then launches the setup wizard.

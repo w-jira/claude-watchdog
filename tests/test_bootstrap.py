@@ -72,8 +72,10 @@ def test_bootstrap_refuses_non_git_install_dir(tmp_path):
     assert "exists but is not a git checkout" in result.stderr
 
 
-def test_bootstrap_reconnects_setup_stdin_to_tty_when_available():
+def test_bootstrap_handles_piped_mode_safely():
     text = BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "exec ./bin/dog setup </dev/tty" in text
     assert "[ -r /dev/tty ] && [ -w /dev/tty ]" in text
+    assert "no interactive terminal is available" in text
+    assert "bash /tmp/claude-watchdog-bootstrap.sh" in text

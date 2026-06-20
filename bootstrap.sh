@@ -40,4 +40,13 @@ log "starting guided setup"
 if [ -r /dev/tty ] && [ -w /dev/tty ]; then
   exec ./bin/dog setup </dev/tty
 fi
-exec ./bin/dog setup
+
+cat >&2 <<EOF
+[claude-watchdog bootstrap] error: no interactive terminal is available for the setup wizard.
+Run the non-piped installer instead:
+
+  curl -fsSLo /tmp/claude-watchdog-bootstrap.sh ${REPO_URL%/}/raw/main/bootstrap.sh
+  bash /tmp/claude-watchdog-bootstrap.sh
+
+EOF
+exit 1
