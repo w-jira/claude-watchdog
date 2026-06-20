@@ -55,17 +55,22 @@ claude
 
 Official Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 
-## 3. Clone this repo
+## 3. Install and run the guided setup
+
+Fast path, from any directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh | bash
+```
+
+That clones or updates the repo under `~/.local/share/claude-watchdog/repo`, then launches the setup wizard.
+
+Prefer to inspect the repo first? Use the manual path:
 
 ```bash
 cd ~
 git clone https://github.com/w-jira/claude-watchdog.git
 cd claude-watchdog
-```
-
-## 4. Run the guided setup
-
-```bash
 ./bin/dog setup
 ```
 
