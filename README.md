@@ -5,8 +5,8 @@ Run Claude Code from Telegram without babysitting a terminal.
 `claude-watchdog` sets up one always-on Claude Code session, connected through Anthropic's official Telegram plugin. It installs the service, keeps your Claude session alive, auto-heals when it breaks, protects setup from common token leaks, and gives you a small CLI for day-to-day operations.
 
 ```bash
-curl -fsSLo /tmp/claude-watchdog-bootstrap.sh https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh
-bash /tmp/claude-watchdog-bootstrap.sh
+npm install -g @wjira/claude-watchdog
+dog setup
 ```
 
 Prefer to inspect before running? Use the manual path:
@@ -54,13 +54,13 @@ Use the CLI wizard. It keeps the bot token out of shell history and command argu
 Fast path:
 
 ```bash
-curl -fsSLo /tmp/claude-watchdog-bootstrap.sh https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh
-bash /tmp/claude-watchdog-bootstrap.sh
+npm install -g @wjira/claude-watchdog
+dog setup
 ```
 
-That command clones or updates the repo under `~/.local/share/claude-watchdog/repo`, then launches `dog setup`. You can run it from any directory.
+That installs the `dog` command, then launches the setup wizard from anywhere. It does not install Node.js or Claude Code for you.
 
-Manual path:
+Manual GitHub path:
 
 ```bash
 git clone https://github.com/w-jira/claude-watchdog.git

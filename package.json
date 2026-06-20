@@ -1,0 +1,42 @@
+{
+  "name": "@wjira/claude-watchdog",
+  "version": "0.1.0",
+  "description": "Run Claude Code from Telegram without babysitting a terminal.",
+  "license": "MIT",
+  "author": "Jira",
+  "homepage": "https://github.com/w-jira/claude-watchdog#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/w-jira/claude-watchdog.git"
+  },
+  "bugs": {
+    "url": "https://github.com/w-jira/claude-watchdog/issues"
+  },
+  "bin": {
+    "dog": "bin/dog"
+  },
+  "files": [
+    "bin/",
+    "config/",
+    "systemd/",
+    "install.sh",
+    "install-macos.sh",
+    "README.md",
+    "docs/",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "./tests/validate.sh"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "telegram",
+    "watchdog",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
