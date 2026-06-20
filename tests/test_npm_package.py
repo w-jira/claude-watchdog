@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import subprocess
 import tarfile
 from pathlib import Path
@@ -78,3 +79,58 @@ def test_npm_pack_contains_runtime_assets_and_no_runtime_state(tmp_path):
     )
     assert not any(name.endswith(forbidden_suffixes) for name in names)
     assert not any("__pycache__" in name for name in names)
+
+
+def test_npm_installed_setup_finds_packaged_installer_through_bin_symlink(tmp_path):
+    pack_result = run(["npm", "pack", "--json", "--pack-destination", str(tmp_path)])
+    pack_info = json.loads(pack_result.stdout)[0]
+    prefix = tmp_path / "prefix"
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    home.mkdir()
+
+    run([
+        "npm",
+        "install",
+        "-g",
+        "--prefix",
+        str(prefix),
+        str(tmp_path / pack_info["filename"]),
+        "--ignore-scripts",
+    ])
+
+    for name, body in {
+        "claude": "#!/bin/sh\nexit 0\n",
+        "systemctl": "#!/bin/sh\nexit 0\n",
+        "loginctl": "#!/bin/sh\nexit 0\n",
+        "bun": "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 1.3.14\nexit 0\n",
+    }.items():
+        path = fake_bin / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    (home / ".claude").mkdir()
+    (home / ".claude" / ".credentials.json").write_text("{}\n", encoding="utf-8")
+    env = {
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{prefix / 'bin'}:{os.environ['PATH']}",
+        "USER": "watchdogtest",
+    }
+    setup_input = "123456:abcdefghijklmnopqrstuvwxyz\nN\n111222333\n1\nn\nn\nn\n"
+    result = subprocess.run(
+        [str(prefix / "bin" / "dog"), "setup", "--plain"],
+        cwd=tmp_path,
+        env={**os.environ, **env},
+        input=setup_input,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    combined = result.stdout + result.stderr
+    assert "installer assets not found" not in combined
+    assert (home / "bin" / "claude-tele").exists()
+    assert (home / ".config" / "systemd" / "user" / "telegram-claude.service").exists()
+    assert "[claude-watchdog] installed" in combined

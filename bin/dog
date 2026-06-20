@@ -1,7 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+resolve_script_path() {
+  local source="$1" dir target
+  while [ -L "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    target="$(readlink "$source")"
+    case "$target" in
+      /*) source="$target" ;;
+      *) source="${dir}/${target}" ;;
+    esac
+  done
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  printf '%s/%s\n' "$dir" "$(basename "$source")"
+}
+
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 STATE_DIR="${HOME}/.claude/channels/telegram"
 ENV_FILE="${STATE_DIR}/.env"
 ACCESS_FILE="${STATE_DIR}/access.json"
