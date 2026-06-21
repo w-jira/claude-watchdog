@@ -72,6 +72,16 @@ banner() {
 
 # dog is the friendly wrapper; claude-tele is the engine it drives.
 has_claude() { command -v claude >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/claude" ]; }
+tmux_cmd() { env -u TMUX tmux "$@"; }
+claude_tele_engine() {
+  if [ -x "${HOME}/bin/claude-tele" ]; then
+    printf '%s\n' "${HOME}/bin/claude-tele"
+  elif [ -x "$(dirname "$SCRIPT_PATH")/claude-tele" ]; then
+    printf '%s\n' "$(dirname "$SCRIPT_PATH")/claude-tele"
+  else
+    command -v claude-tele 2>/dev/null || return 1
+  fi
+}
 
 # Best-effort login check. Returns 0 if credential markers are found; 1 means
 # "could not confirm" — NOT proof of being logged out, so callers warn (don't hard-fail) on 1.
@@ -179,7 +189,7 @@ preflight() {
 
 cmd_tell() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required"
-  tmux has-session -t "$TMUX_SESSION" 2>/dev/null || die "Claude session not running; start it with: dog start"
+  tmux_cmd has-session -t "$TMUX_SESSION" 2>/dev/null || die "Claude session not running; start it with: dog start"
   telegram_e2e_healthy || die "Telegram E2E health is not fresh; refusing to inject into Claude session"
 
   local message=""
@@ -196,10 +206,10 @@ cmd_tell() {
   tmp="$(mktemp "${TMPDIR:-/tmp}/dog-tell.XXXXXX")"
   trap 'rm -f "$tmp"; trap - RETURN' RETURN
   printf '%s\n' "$message" > "$tmp"
-  tmux load-buffer -t "$TMUX_SESSION" "$tmp"
-  tmux paste-buffer -t "$TMUX_SESSION"
-  tmux delete-buffer 2>/dev/null || true
-  tmux send-keys -t "$TMUX_SESSION" Enter
+  tmux_cmd load-buffer -t "$TMUX_SESSION" "$tmp"
+  tmux_cmd paste-buffer -t "$TMUX_SESSION"
+  tmux_cmd delete-buffer 2>/dev/null || true
+  tmux_cmd send-keys -t "$TMUX_SESSION" Enter
   ok "sent to Claude session"
 }
 
@@ -500,7 +510,10 @@ case "${1:-help}" in
   preflight) preflight ;;
   tell) shift; cmd_tell "$@" ;;
   uninstall) cmd_uninstall "${@:2}" ;;
-  status|start|stop|restart|doctor|logs) command -v claude-tele >/dev/null 2>&1 || die "the claude-tele engine isn't installed yet; run: dog setup"; claude-tele "$@" ;;
+  status|start|stop|restart|doctor|logs)
+    engine="$(claude_tele_engine)" || die "the claude-tele engine isn't installed yet; run: dog setup"
+    "$engine" "$@"
+    ;;
   help|-h|--help) usage ;;
   *) die "unknown command: $1" ;;
 esac
