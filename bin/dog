@@ -74,6 +74,19 @@ banner() {
 has_claude() { command -v claude >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/claude" ]; }
 tmux_cmd() { env -u TMUX tmux "$@"; }
 claude_tele_engine() {
+  local packaged_engine=""
+  case "$(uname -s)" in
+    Darwin) packaged_engine="$(dirname "$SCRIPT_PATH")/claude-tele-macos" ;;
+    *) packaged_engine="$(dirname "$SCRIPT_PATH")/claude-tele" ;;
+  esac
+  case "$ROOT" in
+    */node_modules/@wjira/claude-watchdog)
+      if [ -x "$packaged_engine" ]; then
+        printf '%s\n' "$packaged_engine"
+        return 0
+      fi
+      ;;
+  esac
   if [ -x "${HOME}/bin/claude-tele" ]; then
     printf '%s\n' "${HOME}/bin/claude-tele"
   elif [ -x "$(dirname "$SCRIPT_PATH")/claude-tele" ]; then
