@@ -36,6 +36,7 @@ readonly COMPACT_INFLIGHT="${STATE_DIR}/compact.inflight"
 readonly BACKOFF_FILE="${STATE_DIR}/watchdog.backoff"
 readonly BOT_PID_FILE="${STATE_DIR}/bot.pid"
 readonly ENV_FILE="${STATE_DIR}/.env"
+readonly ACCESS_FILE="${STATE_DIR}/access.json"
 readonly TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 readonly HEALTH_FILE="${STATE_DIR}/plugin-health.json"
@@ -234,6 +235,113 @@ raise SystemExit(0 if ts("last_claude_auth_error_at") > ts("last_claude_auth_ok_
 PY
 }
 
+claude_auth_ok_present() {
+  local latest=""
+  latest=$(latest_transcript_file 2>/dev/null || true)
+  [ -n "$latest" ] || return 1
+  python3 - "$latest" <<'PY'
+import json, re, sys
+from pathlib import Path
+pat = re.compile(r"Please run /login|API Error: 401[^\n]*Invalid authentication credentials", re.I)
+try:
+    lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+except Exception:
+    raise SystemExit(1)
+auth_err = ""
+auth_ok = ""
+for line in lines:
+    try:
+        obj = json.loads(line)
+    except Exception:
+        if pat.search(line):
+            auth_err = auth_err or "unknown"
+        continue
+    ts = str(obj.get("timestamp") or "")
+    msg = obj.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        continue
+    text = json.dumps(msg.get("content", ""), ensure_ascii=False)
+    if pat.search(text):
+        auth_err = ts or "unknown"
+    elif msg.get("model") and msg.get("model") != "<synthetic>":
+        auth_ok = ts or auth_ok
+if auth_ok and (not auth_err or auth_ok > auth_err):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+record_claude_auth_ok() {
+  local source="$1"
+  python3 - "$HEALTH_FILE" "$source" <<'PY' || true
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+source = sys.argv[2]
+try:
+    current = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(current, dict):
+        current = {}
+except Exception:
+    current = {}
+now = int(time.time())
+current.update({
+    "last_claude_auth_ok_at": now,
+    "last_claude_auth_ok_source": source,
+    "last_error": None,
+    "updated_at": now,
+})
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+tmp.chmod(0o600)
+tmp.replace(path)
+PY
+  loginfo "claude auth recovery detected" "source=${source}"
+}
+
+telegram_alert_targets() {
+  python3 - "$ACCESS_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+targets = payload.get("allowFrom") if isinstance(payload, dict) else []
+if not isinstance(targets, list):
+    raise SystemExit(0)
+seen = set()
+for item in targets:
+    value = str(item).strip()
+    if value.isdigit() and value not in seen:
+        seen.add(value)
+        print(value)
+PY
+}
+
+send_telegram_alert() {
+  local body="$1" token targets sent=0 chat_id http_code
+  command -v curl >/dev/null 2>&1 || { logwarn "telegram alert skipped" "reason=curl_missing"; return 0; }
+  token="$(resolve_bot_token)" || token=""
+  [ -n "$token" ] || { logwarn "telegram alert skipped" "reason=token_unresolved"; return 0; }
+  targets="$(telegram_alert_targets || true)"
+  [ -n "$targets" ] || { logwarn "telegram alert skipped" "reason=no_allowlisted_dm_targets"; return 0; }
+  while IFS= read -r chat_id; do
+    [ -n "$chat_id" ] || continue
+    http_code=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\nform = "chat_id=%s"\nform = "text=%s"\nform = "disable_web_page_preview=true"\n' "$token" "$chat_id" "$body" \
+      | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - 2>/dev/null) || http_code="000"
+    if [ "$http_code" = "200" ]; then
+      sent=$((sent + 1))
+    else
+      logwarn "telegram alert send failed" "chat_id=${chat_id} http_code=${http_code}"
+    fi
+  done <<EOF
+$targets
+EOF
+  [ "$sent" -gt 0 ] && loginfo "telegram alert sent" "targets=${sent}"
+  return 0
+}
+
 record_claude_auth_failure() {
   local source="$1" now last=0
   now=$(date +%s)
@@ -265,8 +373,13 @@ PY
   fi
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
   if [ $((now - last)) -ge "$CLAUDE_AUTH_ALERT_COOLDOWN" ]; then
-    echo "$now" > "${CLAUDE_AUTH_ALERT_STATE}.tmp" && mv "${CLAUDE_AUTH_ALERT_STATE}.tmp" "$CLAUDE_AUTH_ALERT_STATE"
+    echo "$now" > "${CLAUDE_AUTH_ALERT_STATE}.tmp"
+    chmod 600 "${CLAUDE_AUTH_ALERT_STATE}.tmp" 2>/dev/null || true
+    mv "${CLAUDE_AUTH_ALERT_STATE}.tmp" "$CLAUDE_AUTH_ALERT_STATE"
     logerr "claude auth failure detected — no heal attempted" "source=${source} action=run_claude_login"
+    local alert_body
+    alert_body="Claude Code auth expired for claude-tele. I will not restart or auto-login.\n\nFix:\n1. Run: claude-tele attach\n2. Run /login in Claude Code\n3. Verify: dog status && dog doctor\n\nSource: ${source}"
+    send_telegram_alert "$alert_body"
     send_alert_email \
       "claude-tele: Claude auth expired — login required" \
       "Claude Code reported API Error 401 / login required. No restart or auto-login was attempted.
@@ -650,11 +763,17 @@ while true; do
 
   # 3. Known Claude auth failure? Alert only; do not restart or auto-login.
   # Check health before tmux healing so an auth-expired session does not get
-  # restarted in a loop if Claude exits after reporting 401.
+  # restarted in a loop if Claude exits after reporting 401. If the session is
+  # alive and a later real assistant message exists, clear the sticky health
+  # error so normal healing resumes after the user completes /login.
   if claude_auth_failure_in_health; then
-    record_claude_auth_failure "health"
-    nap "$INTERVAL"
-    continue
+    if tmux has-session -t "$SESSION" 2>/dev/null && ! claude_auth_failure_present >/dev/null 2>&1 && claude_auth_ok_present; then
+      record_claude_auth_ok "transcript"
+    else
+      record_claude_auth_failure "health"
+      nap "$INTERVAL"
+      continue
+    fi
   fi
 
   # 4. tmux session missing with active service → heal.

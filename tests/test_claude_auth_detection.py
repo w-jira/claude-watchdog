@@ -14,6 +14,27 @@ def write_executable(path: Path, body: str):
     path.chmod(0o755)
 
 
+def write_telegram_auth_config(state: Path, user_id: str = "12345"):
+    env_path = state / ".env"
+    current = env_path.read_text(encoding="utf-8")
+    env_path.write_text(current + "TELEGRAM_BOT_TOKEN=test-token\n", encoding="utf-8")
+    (state / "access.json").write_text(
+        json.dumps({"dmPolicy": "allowlist", "allowFrom": [user_id]}) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_transcript(home: Path, messages):
+    workdir = home / ".claude" / "channels" / "telegram" / "workdir"
+    slug = str(workdir).replace("/", "-").replace(".", "-")
+    transcript_dir = home / ".claude" / "projects" / slug
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "session.jsonl").write_text(
+        "\n".join(json.dumps(message) for message in messages) + "\n",
+        encoding="utf-8",
+    )
+
+
 def base_env(tmp_path: Path, pane_text: str = "❯\n", has_session: bool = True):
     fake_bin = tmp_path / "bin"
     home = tmp_path / "home"
@@ -181,3 +202,87 @@ def test_watchdog_health_auth_failure_suppresses_tmux_missing_heal(tmp_path):
     health = json.loads((state / "plugin-health.json").read_text(encoding="utf-8"))
     assert health["last_error"] == "Claude auth expired: API Error 401; run /login"
     assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_failure_sends_direct_telegram_alert(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    write_telegram_auth_config(state, "12345")
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    write_executable(
+        fake_curl,
+        "#!/bin/sh\n"
+        "cat > \"$HOME/curl-request.log\"\n"
+        "printf '200'\n",
+    )
+
+    run_watchdog_once(watchdog_env(env))
+
+    request = (home / "curl-request.log").read_text(encoding="utf-8")
+    assert "sendMessage" in request
+    assert "chat_id=12345" in request
+    assert "Claude Code auth expired" in request
+    assert "test-token" in request
+    assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_failure_alert_respects_cooldown(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    write_telegram_auth_config(state, "12345")
+    (state / "watchdog.claude-auth.state").write_text("9999999999\n", encoding="utf-8")
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    write_executable(fake_curl, "#!/bin/sh\ncat >> \"$HOME/curl-request.log\"\nprintf '200'\n")
+
+    run_watchdog_once(watchdog_env(env))
+
+    assert not (home / "curl-request.log").exists()
+    assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_recovery_clears_sticky_health_state(tmp_path):
+    env, home, state = base_env(tmp_path, "❯\n")
+    (state / "plugin-health.json").write_text(
+        json.dumps({"last_claude_auth_error_at": 200, "last_claude_auth_ok_at": 100}) + "\n",
+        encoding="utf-8",
+    )
+    write_transcript(home, [
+        {
+            "timestamp": "2026-06-22T00:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "Please run /login · API Error: 401 Invalid authentication credentials"}],
+            },
+        },
+        {
+            "timestamp": "2026-06-22T00:01:00.000Z",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "auth restored"}],
+            },
+        },
+    ])
+
+    run_watchdog_once(watchdog_env(env))
+
+    health = json.loads((state / "plugin-health.json").read_text(encoding="utf-8"))
+    assert health["last_claude_auth_ok_at"] > health["last_claude_auth_error_at"]
+    assert health["last_error"] is None
+
+
+def test_watchdog_recovered_auth_allows_tmux_missing_heal(tmp_path):
+    env, home, state = base_env(tmp_path, has_session=False)
+    (state / "plugin-health.json").write_text(
+        json.dumps({"last_claude_auth_error_at": 100, "last_claude_auth_ok_at": 200}) + "\n",
+        encoding="utf-8",
+    )
+
+    run_watchdog_once(watchdog_env(env))
+
+    assert "restart\n" in (home / "restarts.log").read_text(encoding="utf-8")
