@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-bash -n bootstrap.sh bin/dog bin/claude-tele bin/claude-tele-watchdog bin/claude-tele-macos install.sh install-macos.sh
+bash -n bootstrap.sh bin/dog bin/claude-tele bin/claude-tele-watchdog install.sh
 python3 -m py_compile \
   bin/claude-tele-patch-telegram-plugin \
   bin/claude-tele-replay-missed \

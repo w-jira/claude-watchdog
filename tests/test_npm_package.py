@@ -39,7 +39,6 @@ def test_package_json_exposes_dog_cli_without_install_scripts():
         "config/",
         "systemd/",
         "install.sh",
-        "install-macos.sh",
         "README.md",
         "docs/",
         "SECURITY.md",
@@ -47,13 +46,12 @@ def test_package_json_exposes_dog_cli_without_install_scripts():
     ]
 
 
-def test_npm_setup_installers_use_shim_instead_of_copying_stale_dog():
-    for script_name in ("install.sh", "install-macos.sh"):
-        text = (ROOT / script_name).read_text(encoding="utf-8")
-        assert "NPM_PACKAGE_INSTALL=0" in text
-        assert "*/node_modules/@wjira/claude-watchdog) NPM_PACKAGE_INSTALL=1 ;;" in text
-        assert "install_npm_bin_shim" in text
-        assert "installed ~/bin shims to delegate to the npm package CLI" in text
+def test_npm_setup_installer_uses_shim_instead_of_copying_stale_dog():
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert "NPM_PACKAGE_INSTALL=0" in text
+    assert "*/node_modules/@wjira/claude-watchdog) NPM_PACKAGE_INSTALL=1 ;;" in text
+    assert "install_npm_bin_shim" in text
+    assert "installed ~/bin shims to delegate to the npm package CLI" in text
 
 
 def test_npm_pack_contains_runtime_assets_and_no_runtime_state(tmp_path):

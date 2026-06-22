@@ -22,7 +22,6 @@
     "config/",
     "systemd/",
     "install.sh",
-    "install-macos.sh",
     "README.md",
     "docs/",
     "SECURITY.md",

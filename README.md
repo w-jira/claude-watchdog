@@ -79,7 +79,7 @@ The wizard asks for:
 
 By default, `dog setup` encrypts the Telegram token at rest when OpenSSL is available. The runtime service decrypts it only when starting Claude and passes it through the process environment, where the official plugin can read it. If OpenSSL is missing, setup falls back to a private `0600` `.env` file and prints a warning.
 
-The Linux/macOS encryption key is stored in the same private state directory as the encrypted token. This removes the token from `.env` and casual text exposure, but it does not protect against malware, a compromised OS account, or backups that include both `.token.enc` and `.token.key`.
+The Linux encryption key is stored in the same private state directory as the encrypted token. This removes the token from `.env` and casual text exposure, but it does not protect against malware, a compromised OS account, or backups that include both `.token.enc` and `.token.key`.
 
 ## Daily commands
 
@@ -114,8 +114,6 @@ claude-tele attach
 ## Platform support
 
 - Linux: full support. Uses `systemd --user`, `tmux`, watchdog auto-heal, context compaction, and missed-message replay.
-- macOS: beta. Uses LaunchAgent and `tmux`. Supports setup, start/stop/restart, status, logs, attach, heal, and doctor. The full Linux watchdog is not implemented yet.
-- Windows native: beta. Uses PowerShell and a per-user Scheduled Task. Good for basic always-on operation. WSL2 is still the better Windows path if you want Linux-equivalent behavior.
 
 ## Requirements
 
@@ -169,21 +167,6 @@ TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
   ./install.sh --install-deps --permission-mode default --demo --start --yes
 ```
 
-macOS:
-
-```bash
-TELEGRAM_BOT_TOKEN='<bot-token>' TELEGRAM_USER_ID='<telegram-user-id>' \
-  ./install-macos.sh --install-deps --permission-mode default --demo --start --yes
-```
-
-Windows PowerShell:
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN = "<bot-token>"
-$env:TELEGRAM_USER_ID = "<telegram-user-id>"
-.\install-windows.ps1 -InstallDeps -PermissionMode default -Demo -Start -Yes
-```
-
 These paths are useful for agents and CI, but they are less safe for humans because tokens can land in shell history or process environments. Prefer `dog setup` when you are at a terminal.
 
 ## Security model
@@ -192,9 +175,9 @@ These paths are useful for agents and CI, but they are less safe for humans beca
 
 - token input is hidden in the setup wizard
 - token is not passed to child installers as an argument
-- generated config files are private (`0600` on Linux/macOS, restricted ACLs on Windows)
+- generated config files are private (`0600` on Linux)
 - `dog setup` encrypts the bot token at rest when OpenSSL is available
-- Linux/macOS keep the token encryption key next to the encrypted token, so OS-account security still matters
+- Linux keeps the token encryption key next to the encrypted token, so OS-account security still matters
 - `.env` is parsed as data, never sourced or evaluated
 - Telegram access is allowlisted by user ID
 - the Claude session runs from an isolated workdir

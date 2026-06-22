@@ -74,11 +74,7 @@ banner() {
 has_claude() { command -v claude >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/claude" ]; }
 tmux_cmd() { env -u TMUX tmux "$@"; }
 claude_tele_engine() {
-  local packaged_engine=""
-  case "$(uname -s)" in
-    Darwin) packaged_engine="$(dirname "$SCRIPT_PATH")/claude-tele-macos" ;;
-    *) packaged_engine="$(dirname "$SCRIPT_PATH")/claude-tele" ;;
-  esac
+  local packaged_engine="$(dirname "$SCRIPT_PATH")/claude-tele"
   case "$ROOT" in
     */node_modules/@wjira/claude-watchdog)
       if [ -x "$packaged_engine" ]; then
@@ -173,8 +169,8 @@ preflight() {
   local hard=0
   log "${BOLD}Preflight — checking this machine${RESET}"
   case "$(uname -s)" in
-    Linux|Darwin) ok "OS $(uname -s)" ;;
-    *) miss "unsupported OS $(uname -s) (Linux/macOS only)"; hard=1 ;;
+    Linux) ok "OS $(uname -s)" ;;
+    *) miss "unsupported OS $(uname -s) (Linux only)"; hard=1 ;;
   esac
   local c
   for c in tmux python3 openssl curl unzip git; do
@@ -241,13 +237,6 @@ cmd_uninstall() {
       systemctl --user disable --now telegram-claude.service telegram-claude-watchdog.service 2>/dev/null || true
       rm -f "${SYSTEMD_DIR}/telegram-claude.service" "${SYSTEMD_DIR}/telegram-claude-watchdog.service"
       systemctl --user daemon-reload 2>/dev/null || true
-      ;;
-    Darwin)
-      for p in "${HOME}/Library/LaunchAgents/"*telegram-claude*.plist; do
-        [ -e "$p" ] || continue
-        launchctl unload "$p" 2>/dev/null || true
-        rm -f "$p"
-      done
       ;;
   esac
   rm -f "${HOME}/bin/dog" "${HOME}/bin/claude-tele" "${HOME}/bin/claude-tele-watchdog" \
@@ -429,9 +418,8 @@ cmd_setup() {
   local installer=""
   if [ -f "${ROOT}/config/env.example" ] && [ -f "${ROOT}/config/access.example.json" ]; then
     case "$(uname -s)" in
-      Darwin) [ -f "${ROOT}/install-macos.sh" ] && installer="${ROOT}/install-macos.sh" ;;
       Linux) [ -f "${ROOT}/install.sh" ] && installer="${ROOT}/install.sh" ;;
-      *) die "setup supports Linux/macOS; use install-windows.ps1 on Windows" ;;
+      *) die "setup supports Linux only" ;;
     esac
   fi
   local config_only=0
