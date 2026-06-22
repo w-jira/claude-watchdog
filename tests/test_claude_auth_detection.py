@@ -14,12 +14,16 @@ def write_executable(path: Path, body: str):
     path.chmod(0o755)
 
 
-def write_telegram_auth_config(state: Path, user_id: str = "12345"):
+def write_telegram_auth_config(state: Path, user_ids=None):
+    if user_ids is None:
+        user_ids = ["12345"]
+    elif isinstance(user_ids, str):
+        user_ids = [user_ids]
     env_path = state / ".env"
     current = env_path.read_text(encoding="utf-8")
     env_path.write_text(current + "TELEGRAM_BOT_TOKEN=test-token\n", encoding="utf-8")
     (state / "access.json").write_text(
-        json.dumps({"dmPolicy": "allowlist", "allowFrom": [user_id]}) + "\n",
+        json.dumps({"dmPolicy": "allowlist", "allowFrom": user_ids}) + "\n",
         encoding="utf-8",
     )
 
@@ -286,3 +290,127 @@ def test_watchdog_recovered_auth_allows_tmux_missing_heal(tmp_path):
     run_watchdog_once(watchdog_env(env))
 
     assert "restart\n" in (home / "restarts.log").read_text(encoding="utf-8")
+
+
+
+def test_watchdog_auth_failure_sends_multiple_numeric_targets_once(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    write_telegram_auth_config(state, ["12345", "abc", "12345", 67890, "-100"])
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    write_executable(
+        fake_curl,
+        "#!/bin/sh\n"
+        "cat >> \"$HOME/curl-request.log\"\n"
+        "printf '\\n---\\n' >> \"$HOME/curl-request.log\"\n"
+        "printf '200'\n",
+    )
+
+    env = watchdog_env(env)
+    env["WATCHDOG_CLAUDE_AUTH_ALERT_COOLDOWN"] = "3600"
+    run_watchdog_once(env)
+
+    request = (home / "curl-request.log").read_text(encoding="utf-8")
+    assert request.count("chat_id=12345") == 1
+    assert request.count("chat_id=67890") == 1
+    assert "chat_id=abc" not in request
+    assert "chat_id=-100" not in request
+    assert (state / "watchdog.claude-auth.state").exists()
+    assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_failure_retries_when_telegram_delivery_fails(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    write_telegram_auth_config(state, "12345")
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    write_executable(
+        fake_curl,
+        "#!/bin/sh\n"
+        "cat >> \"$HOME/curl-request.log\"\n"
+        "printf '500'\n",
+    )
+
+    run_watchdog_once(watchdog_env(env))
+
+    assert (home / "curl-request.log").exists()
+    assert not (state / "watchdog.claude-auth.state").exists()
+    assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_failure_malformed_access_does_not_cooldown(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    env_path = state / ".env"
+    env_path.write_text(env_path.read_text(encoding="utf-8") + "TELEGRAM_BOT_TOKEN=test-token\n", encoding="utf-8")
+    (state / "access.json").write_text("{not-json\n", encoding="utf-8")
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    write_executable(fake_curl, "#!/bin/sh\ncat >> \"$HOME/curl-request.log\"\nprintf '200'\n")
+
+    run_watchdog_once(watchdog_env(env))
+
+    assert not (home / "curl-request.log").exists()
+    assert not (state / "watchdog.claude-auth.state").exists()
+    assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_failure_email_success_sets_cooldown_without_telegram(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    fake_bin = Path(env["PATH"].split(":", 1)[0])
+    write_executable(fake_bin / "msmtp", "#!/bin/sh\ncat > \"$HOME/email.log\"\nexit 0\n")
+    env = watchdog_env(env)
+    env["WATCHDOG_ALERT_EMAIL"] = "alerts"
+
+    run_watchdog_once(env)
+
+    email = (home / "email.log").read_text(encoding="utf-8")
+    assert "Subject: claude-tele: Claude auth expired" in email
+    assert "No restart or auto-login was attempted" in email
+    assert (state / "watchdog.claude-auth.state").exists()
+    assert not (home / "restarts.log").exists()
+
+
+def test_watchdog_auth_failure_uses_encrypted_token_for_telegram_alert(tmp_path):
+    env, home, state = base_env(
+        tmp_path,
+        "Please run /login · API Error: 401 Invalid authentication credentials\n❯\n",
+    )
+    (state / ".env").write_text("TELEGRAM_BOT_TOKEN_ENCRYPTED=1\n", encoding="utf-8")
+    (state / ".token.key").write_text("password\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "openssl",
+            "enc",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-pass",
+            f"file:{state / '.token.key'}",
+            "-out",
+            str(state / ".token.enc"),
+        ],
+        input="encrypted-test-token",
+        text=True,
+        check=True,
+    )
+    (state / "access.json").write_text(
+        json.dumps({"dmPolicy": "allowlist", "allowFrom": ["12345"]}) + "\n",
+        encoding="utf-8",
+    )
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    write_executable(fake_curl, "#!/bin/sh\ncat > \"$HOME/curl-request.log\"\nprintf '200'\n")
+
+    run_watchdog_once(watchdog_env(env))
+
+    request = (home / "curl-request.log").read_text(encoding="utf-8")
+    assert "encrypted-test-token" in request
+    assert "chat_id=12345" in request
+    assert (state / "watchdog.claude-auth.state").exists()

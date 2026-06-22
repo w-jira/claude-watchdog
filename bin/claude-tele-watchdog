@@ -158,9 +158,9 @@ latest_transcript_file() {
   ls -t $glob 2>/dev/null | head -1
 }
 
-claude_auth_failure_present() {
+claude_auth_transcript_state() {
   local pane latest="" pane_file
-  pane=$(capture_pane)
+  pane="${1:-}"
   latest=$(latest_transcript_file 2>/dev/null || true)
   pane_file=$(mktemp "${STATE_DIR}/auth-pane.XXXXXX")
   chmod 600 "$pane_file"
@@ -180,7 +180,7 @@ finally:
     except Exception:
         pass
 if pat.search(pane):
-    print("pane")
+    print("error:pane")
     raise SystemExit(0)
 
 if not latest:
@@ -210,10 +210,22 @@ for line in lines:
         auth_ok = ts or auth_ok
 
 if auth_err and (not auth_ok or auth_err > auth_ok):
-    print("transcript")
+    print("error:transcript")
+    raise SystemExit(0)
+if auth_ok and (not auth_err or auth_ok > auth_err):
+    print("ok:transcript")
     raise SystemExit(0)
 raise SystemExit(1)
 PY
+}
+
+claude_auth_failure_present() {
+  local state
+  state=$(claude_auth_transcript_state "$(capture_pane)" || true)
+  case "$state" in
+    error:*) printf '%s\n' "${state#error:}"; return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 claude_auth_failure_in_health() {
@@ -236,39 +248,9 @@ PY
 }
 
 claude_auth_ok_present() {
-  local latest=""
-  latest=$(latest_transcript_file 2>/dev/null || true)
-  [ -n "$latest" ] || return 1
-  python3 - "$latest" <<'PY'
-import json, re, sys
-from pathlib import Path
-pat = re.compile(r"Please run /login|API Error: 401[^\n]*Invalid authentication credentials", re.I)
-try:
-    lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
-except Exception:
-    raise SystemExit(1)
-auth_err = ""
-auth_ok = ""
-for line in lines:
-    try:
-        obj = json.loads(line)
-    except Exception:
-        if pat.search(line):
-            auth_err = auth_err or "unknown"
-        continue
-    ts = str(obj.get("timestamp") or "")
-    msg = obj.get("message")
-    if not isinstance(msg, dict) or msg.get("role") != "assistant":
-        continue
-    text = json.dumps(msg.get("content", ""), ensure_ascii=False)
-    if pat.search(text):
-        auth_err = ts or "unknown"
-    elif msg.get("model") and msg.get("model") != "<synthetic>":
-        auth_ok = ts or auth_ok
-if auth_ok and (not auth_err or auth_ok > auth_err):
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
+  local state
+  state=$(claude_auth_transcript_state "" || true)
+  [ "$state" = "ok:transcript" ]
 }
 
 record_claude_auth_ok() {
@@ -321,11 +303,11 @@ PY
 
 send_telegram_alert() {
   local body="$1" token targets sent=0 chat_id http_code
-  command -v curl >/dev/null 2>&1 || { logwarn "telegram alert skipped" "reason=curl_missing"; return 0; }
+  command -v curl >/dev/null 2>&1 || { logwarn "telegram alert skipped" "reason=curl_missing"; return 1; }
   token="$(resolve_bot_token)" || token=""
-  [ -n "$token" ] || { logwarn "telegram alert skipped" "reason=token_unresolved"; return 0; }
+  [ -n "$token" ] || { logwarn "telegram alert skipped" "reason=token_unresolved"; return 1; }
   targets="$(telegram_alert_targets || true)"
-  [ -n "$targets" ] || { logwarn "telegram alert skipped" "reason=no_allowlisted_dm_targets"; return 0; }
+  [ -n "$targets" ] || { logwarn "telegram alert skipped" "reason=no_allowlisted_dm_targets"; return 1; }
   while IFS= read -r chat_id; do
     [ -n "$chat_id" ] || continue
     http_code=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\nform = "chat_id=%s"\nform = "text=%s"\nform = "disable_web_page_preview=true"\n' "$token" "$chat_id" "$body" \
@@ -338,8 +320,11 @@ send_telegram_alert() {
   done <<EOF
 $targets
 EOF
-  [ "$sent" -gt 0 ] && loginfo "telegram alert sent" "targets=${sent}"
-  return 0
+  if [ "$sent" -gt 0 ]; then
+    loginfo "telegram alert sent" "targets=${sent}"
+    return 0
+  fi
+  return 1
 }
 
 record_claude_auth_failure() {
@@ -373,13 +358,10 @@ PY
   fi
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
   if [ $((now - last)) -ge "$CLAUDE_AUTH_ALERT_COOLDOWN" ]; then
-    echo "$now" > "${CLAUDE_AUTH_ALERT_STATE}.tmp"
-    chmod 600 "${CLAUDE_AUTH_ALERT_STATE}.tmp" 2>/dev/null || true
-    mv "${CLAUDE_AUTH_ALERT_STATE}.tmp" "$CLAUDE_AUTH_ALERT_STATE"
     logerr "claude auth failure detected — no heal attempted" "source=${source} action=run_claude_login"
-    local alert_body
+    local alert_body delivered=0
     alert_body="Claude Code auth expired for claude-tele. I will not restart or auto-login.\n\nFix:\n1. Run: claude-tele attach\n2. Run /login in Claude Code\n3. Verify: dog status && dog doctor\n\nSource: ${source}"
-    send_telegram_alert "$alert_body"
+    send_telegram_alert "$alert_body" && delivered=1
     send_alert_email \
       "claude-tele: Claude auth expired — login required" \
       "Claude Code reported API Error 401 / login required. No restart or auto-login was attempted.
@@ -389,7 +371,14 @@ Fix:
   2. Run /login in Claude Code and complete login
   3. Verify: dog status && dog doctor
 
-Source: ${source}"
+Source: ${source}" && delivered=1
+    if [ "$delivered" = "1" ]; then
+      echo "$now" > "${CLAUDE_AUTH_ALERT_STATE}.tmp"
+      chmod 600 "${CLAUDE_AUTH_ALERT_STATE}.tmp" 2>/dev/null || true
+      mv "${CLAUDE_AUTH_ALERT_STATE}.tmp" "$CLAUDE_AUTH_ALERT_STATE"
+    else
+      logwarn "claude auth alert delivery failed — retrying next cycle" "source=${source}"
+    fi
   else
     logwarn "claude auth failure still present — alert suppressed by cooldown" "source=${source}"
   fi
@@ -500,10 +489,15 @@ trip_count_in_window() {
 
 send_alert_email() {
   local subject="$1" body="$2"
-  [ -n "$ALERT_EMAIL" ] || return 0
-  command -v msmtp >/dev/null 2>&1 || return 0
-  printf "Subject: %s\r\nFrom: %s\r\nTo: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s\r\n" \
-    "$subject" "$ALERT_FROM" "$ALERT_EMAIL" "$body" | msmtp -a "$MSMTP_ACCOUNT" "$ALERT_EMAIL" 2>/dev/null || true
+  [ -n "$ALERT_EMAIL" ] || return 1
+  command -v msmtp >/dev/null 2>&1 || { logwarn "email alert skipped" "reason=msmtp_missing"; return 1; }
+  if printf "Subject: %s\r\nFrom: %s\r\nTo: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s\r\n" \
+    "$subject" "$ALERT_FROM" "$ALERT_EMAIL" "$body" | msmtp -a "$MSMTP_ACCOUNT" "$ALERT_EMAIL" 2>/dev/null; then
+    loginfo "email alert sent"
+    return 0
+  fi
+  logwarn "email alert send failed"
+  return 1
 }
 
 # [H-15] Record BEFORE attempt (not after); bump breaker regardless of heal
@@ -547,7 +541,7 @@ Check:
 EOF
 )
     logcrit "circuit breaker tripped" "trip=${trip} stage_secs=${stage_secs} in_window=${in_window}"
-    send_alert_email "$subject" "$body"
+    send_alert_email "$subject" "$body" || true
     return
   fi
 
