@@ -39,6 +39,8 @@ readonly ENV_FILE="${STATE_DIR}/.env"
 readonly TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 readonly HEALTH_FILE="${STATE_DIR}/plugin-health.json"
+readonly WORKDIR="${STATE_DIR}/workdir"
+readonly CLAUDE_AUTH_ALERT_STATE="${STATE_DIR}/watchdog.claude-auth.state"
 readonly LOG_TAG="claude-tele-watchdog"
 readonly ALERT_EMAIL="${WATCHDOG_ALERT_EMAIL:-}"
 readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
@@ -52,6 +54,7 @@ GETME_EVERY="${WATCHDOG_GETME_EVERY:-3}"
 WARMUP="${WATCHDOG_WARMUP:-10}"
 DEBUG="${WATCHDOG_DEBUG:-0}"
 HEARTBEAT_LOG_EVERY="${WATCHDOG_HEARTBEAT_LOG_EVERY:-0}"
+CLAUDE_AUTH_ALERT_COOLDOWN="${WATCHDOG_CLAUDE_AUTH_ALERT_COOLDOWN:-3600}"
 
 # [H-16] Circuit-breaker: widened from 3-in-1800s (50% duty cycle) to 5-in-7200s.
 # Exponential backoff: 1st trip suppresses 30m, 2nd trip 2h, 3rd+ trips 24h + email.
@@ -139,6 +142,145 @@ bun_alive() {
 }
 
 capture_pane() { tmux capture-pane -t "$SESSION" -p -S -15 2>/dev/null || true; }
+
+workdir_transcript_glob() {
+  local slug
+  slug="${WORKDIR//\//-}"
+  slug="${slug//./-}"
+  echo "${HOME}/.claude/projects/${slug}/*.jsonl"
+}
+
+latest_transcript_file() {
+  local glob
+  glob=$(workdir_transcript_glob)
+  compgen -G "$glob" >/dev/null || return 1
+  ls -t $glob 2>/dev/null | head -1
+}
+
+claude_auth_failure_present() {
+  local pane latest="" pane_file
+  pane=$(capture_pane)
+  latest=$(latest_transcript_file 2>/dev/null || true)
+  pane_file=$(mktemp "${STATE_DIR}/auth-pane.XXXXXX")
+  chmod 600 "$pane_file"
+  printf '%s\n' "$pane" > "$pane_file"
+  python3 - "$latest" "$pane_file" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+latest = sys.argv[1]
+pane_file = Path(sys.argv[2])
+pat = re.compile(r"Please run /login|API Error: 401[^\n]*Invalid authentication credentials", re.I)
+try:
+    pane = pane_file.read_text(encoding="utf-8", errors="replace")
+finally:
+    try:
+        pane_file.unlink()
+    except Exception:
+        pass
+if pat.search(pane):
+    print("pane")
+    raise SystemExit(0)
+
+if not latest:
+    raise SystemExit(1)
+try:
+    lines = Path(latest).read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+except Exception:
+    raise SystemExit(1)
+
+auth_err = ""
+auth_ok = ""
+for line in lines:
+    try:
+        obj = json.loads(line)
+    except Exception:
+        if pat.search(line):
+            auth_err = auth_err or "unknown"
+        continue
+    ts = str(obj.get("timestamp") or "")
+    msg = obj.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        continue
+    text = json.dumps(msg.get("content", ""), ensure_ascii=False)
+    if pat.search(text):
+        auth_err = ts or "unknown"
+    elif msg.get("model") and msg.get("model") != "<synthetic>":
+        auth_ok = ts or auth_ok
+
+if auth_err and (not auth_ok or auth_err > auth_ok):
+    print("transcript")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+claude_auth_failure_in_health() {
+  python3 - "$HEALTH_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    health = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    if not isinstance(health, dict):
+        raise ValueError("invalid health")
+except Exception:
+    raise SystemExit(1)
+def ts(key):
+    try:
+        return int(health.get(key) or 0)
+    except Exception:
+        return 0
+raise SystemExit(0 if ts("last_claude_auth_error_at") > ts("last_claude_auth_ok_at") else 1)
+PY
+}
+
+record_claude_auth_failure() {
+  local source="$1" now last=0
+  now=$(date +%s)
+  python3 - "$HEALTH_FILE" "$source" <<'PY' || true
+import json, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+source = sys.argv[2]
+try:
+    current = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(current, dict):
+        current = {}
+except Exception:
+    current = {}
+now = int(time.time())
+current.update({
+    "last_claude_auth_error_at": now,
+    "last_claude_auth_error_source": source,
+    "last_error": "Claude auth expired: API Error 401; run /login",
+    "updated_at": now,
+})
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+tmp.chmod(0o600)
+tmp.replace(path)
+PY
+  if [ -r "$CLAUDE_AUTH_ALERT_STATE" ]; then
+    last=$(cat "$CLAUDE_AUTH_ALERT_STATE" 2>/dev/null || echo 0)
+  fi
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if [ $((now - last)) -ge "$CLAUDE_AUTH_ALERT_COOLDOWN" ]; then
+    echo "$now" > "${CLAUDE_AUTH_ALERT_STATE}.tmp" && mv "${CLAUDE_AUTH_ALERT_STATE}.tmp" "$CLAUDE_AUTH_ALERT_STATE"
+    logerr "claude auth failure detected — no heal attempted" "source=${source} action=run_claude_login"
+    send_alert_email \
+      "claude-tele: Claude auth expired — login required" \
+      "Claude Code reported API Error 401 / login required. No restart or auto-login was attempted.
+
+Fix:
+  1. Attach locally: claude-tele attach
+  2. Run /login in Claude Code and complete login
+  3. Verify: dog status && dog doctor
+
+Source: ${source}"
+  else
+    logwarn "claude auth failure still present — alert suppressed by cooldown" "source=${source}"
+  fi
+}
 
 extract_pct() {
   # Status bar renders: "<project> ██████░░░░ NN%" — grab the last NN%.
@@ -506,14 +648,31 @@ while true; do
     continue
   fi
 
-  # 3. tmux session missing with active service → heal.
+  # 3. Known Claude auth failure? Alert only; do not restart or auto-login.
+  # Check health before tmux healing so an auth-expired session does not get
+  # restarted in a loop if Claude exits after reporting 401.
+  if claude_auth_failure_in_health; then
+    record_claude_auth_failure "health"
+    nap "$INTERVAL"
+    continue
+  fi
+
+  # 4. tmux session missing with active service → heal.
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     invoke_heal "tmux session missing"
     nap "$INTERVAL"
     continue
   fi
 
-  # 4. bun bridge missing → messages can't flow → heal. Two consecutive
+  # 5. Claude auth expired? Alert only; do not restart or auto-login.
+  auth_source="$(claude_auth_failure_present || true)"
+  if [ -n "$auth_source" ]; then
+    record_claude_auth_failure "$auth_source"
+    nap "$INTERVAL"
+    continue
+  fi
+
+  # 6. bun bridge missing → messages can't flow → heal. Two consecutive
   #    checks to absorb a fork/exec blip.
   if ! bun_alive; then
     logdebug "bun bridge missing on first check" "cycle=${cycle}"
@@ -527,7 +686,7 @@ while true; do
     fi
   fi
 
-  # 5. Telegram E2E liveness every GETME_EVERY cycles. Three consecutive
+  # 7. Telegram E2E liveness every GETME_EVERY cycles. Three consecutive
   #    failures trigger heal (catches API outage + recovered-by-restart cases).
   if [ $((cycle % GETME_EVERY)) -eq 0 ]; then
     if getme_probe; then
@@ -545,7 +704,7 @@ while true; do
     fi
   fi
 
-  # 6. Auto-compact when context ≥ threshold AND session is idle.
+  # 8. Auto-compact when context ≥ threshold AND session is idle.
   pane=$(capture_pane)
   pct=$(extract_pct "$pane") || pct=""
   if [ -z "$pct" ] || ! [[ "$pct" =~ ^[0-9]+$ ]]; then

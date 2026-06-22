@@ -245,6 +245,90 @@ workdir_transcript_glob() {
   echo "${HOME}/.claude/projects/${slug}/*.jsonl"
 }
 
+latest_transcript_file() {
+  local glob
+  glob=$(workdir_transcript_glob)
+  compgen -G "$glob" >/dev/null || return 1
+  ls -t $glob 2>/dev/null | head -1
+}
+
+claude_auth_failure_present() {
+  local pane latest="" pane_file
+  pane=$(capture_pane)
+  latest=$(latest_transcript_file 2>/dev/null || true)
+  pane_file=$(mktemp "${STATE_DIR}/auth-pane.XXXXXX")
+  chmod 600 "$pane_file"
+  printf '%s\n' "$pane" > "$pane_file"
+  python3 - "$latest" "$pane_file" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+latest = sys.argv[1]
+pane_file = Path(sys.argv[2])
+pat = re.compile(r"Please run /login|API Error: 401[^\n]*Invalid authentication credentials", re.I)
+try:
+    pane = pane_file.read_text(encoding="utf-8", errors="replace")
+finally:
+    try:
+        pane_file.unlink()
+    except Exception:
+        pass
+if pat.search(pane):
+    print("pane")
+    raise SystemExit(0)
+
+if not latest:
+    raise SystemExit(1)
+try:
+    lines = Path(latest).read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+except Exception:
+    raise SystemExit(1)
+
+auth_err = ""
+auth_ok = ""
+for line in lines:
+    try:
+        obj = json.loads(line)
+    except Exception:
+        if pat.search(line):
+            auth_err = auth_err or "unknown"
+        continue
+    ts = str(obj.get("timestamp") or "")
+    msg = obj.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        continue
+    text = json.dumps(msg.get("content", ""), ensure_ascii=False)
+    if pat.search(text):
+        auth_err = ts or "unknown"
+    elif msg.get("model") and msg.get("model") != "<synthetic>":
+        auth_ok = ts or auth_ok
+
+if auth_err and (not auth_ok or auth_err > auth_ok):
+    print("transcript")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+claude_auth_failure_in_health() {
+  python3 - "$HEALTH_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    health = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    if not isinstance(health, dict):
+        raise ValueError("invalid health")
+except Exception:
+    raise SystemExit(1)
+def ts(key):
+    try:
+        return int(health.get(key) or 0)
+    except Exception:
+        return 0
+raise SystemExit(0 if ts("last_claude_auth_error_at") > ts("last_claude_auth_ok_at") else 1)
+PY
+}
+
 # [M-9] Recursive pane → claude PID walk. Claude may be wrapped by tmux's
 # default shell or systemd's exec wrapper; search up to 4 levels deep.
 resolve_claude_pid() {
@@ -548,6 +632,17 @@ cmd_status() {
     [ -n "$pct" ] && ok "context:  ${pct}"
   fi
 
+  if claude_auth_failure_present >/dev/null 2>&1 || { ! session_exists && claude_auth_failure_in_health; }; then
+    if is_demo; then
+      echo "${RED}✗ claude auth: action required${RESET}"
+    else
+      echo "${RED}✗ claude auth: expired / API 401 — run /login${RESET}"
+      echo "  ${DIM}fix: claude-tele attach, run /login, then verify with dog status${RESET}"
+    fi
+  else
+    ok "claude auth: no 401/login prompt detected"
+  fi
+
   if bun_alive; then
     # Report the PID from bot.pid when available, else the first matching bun.
     local bp=""
@@ -715,6 +810,14 @@ cmd_doctor() {
   local_check "service enabled on boot"                         soft   systemctl --user is-enabled --quiet "$SERVICE"
   local_check "watchdog enabled on boot"                        soft   systemctl --user is-enabled --quiet "$WATCHDOG_SERVICE"
   local_check "lingering enabled (survives logout)"                  fatal  bash -c "loginctl show-user \$(id -un) 2>/dev/null | grep -q 'Linger=yes'"
+
+  if claude_auth_failure_present >/dev/null 2>&1 || { ! session_exists && claude_auth_failure_in_health; }; then
+    echo "${RED}✗ Claude Code auth check — 401/login prompt detected${RESET}"
+    echo "  ${DIM}fix: claude-tele attach, then run /login; watchdog will not restart or auto-login${RESET}"
+    issues=$((issues + 1))
+  else
+    ok "Claude Code auth: no 401/login prompt detected"
+  fi
 
   [ "$issues" -eq 0 ] && ok "all checks passed" || die "${issues} issue(s)"
 }
