@@ -154,7 +154,10 @@ bun_alive() {
 }
 
 capture_pane() {
-  tmux_cmd capture-pane -t "$SESSION" -p -S -30 2>/dev/null || true
+  local pane
+  pane=$(tmux_cmd capture-pane -t "$SESSION" -p -S -30 2>/dev/null) || return 1
+  [[ "$pane" =~ [^[:space:]] ]] || return 1
+  printf '%s\n' "$pane"
 }
 
 extract_pct() {
@@ -254,7 +257,7 @@ latest_transcript_file() {
 
 claude_auth_failure_present() {
   local pane latest="" pane_file
-  pane=$(capture_pane)
+  pane=$(capture_pane 2>/dev/null || true)
   latest=$(latest_transcript_file 2>/dev/null || true)
   pane_file=$(mktemp "${STATE_DIR}/auth-pane.XXXXXX")
   chmod 600 "$pane_file"
@@ -747,7 +750,10 @@ cmd_compact() {
   fi
 
   local pane before
-  pane=$(capture_pane)
+  if ! pane=$(capture_pane); then
+    compact_reply "$json" false "pane_unavailable" "Claude pane could not be captured; session state is unknown"
+    return 1
+  fi
   before=$(extract_pct "$pane")
   if ! pane_idle "$pane"; then
     compact_reply "$json" false "busy" "Claude session is busy; not sending /compact" "$before"
@@ -758,8 +764,20 @@ cmd_compact() {
     return 1
   fi
 
-  date +%s > "$COMPACT_INFLIGHT"
-  date +%s > "$WATCHDOG_STATE_FILE"
+  local now state_tmp source
+  now=$(date +%s)
+  state_tmp="${WATCHDOG_STATE_FILE}.tmp"
+  source="unknown"
+  [ -n "$before" ] && source="meter"
+  {
+    printf 'context_pct=%s\n' "${before:-unknown}"
+    printf 'context_source=%s\n' "$source"
+    printf 'last_compact=%s\n' "$now"
+    printf 'updated_at=%s\n' "$now"
+  } > "$state_tmp"
+  chmod 600 "$state_tmp" 2>/dev/null || true
+  mv "$state_tmp" "$WATCHDOG_STATE_FILE"
+  printf '%s\n' "$now" > "$COMPACT_INFLIGHT"
   tmux_cmd send-keys -t "$SESSION" -- "/compact" Enter
   (
     sleep "$COMPACT_SENTINEL_TTL"

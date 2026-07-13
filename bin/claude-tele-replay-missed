@@ -210,7 +210,7 @@ def tmux_has_session() -> bool:
   return subprocess.run(["tmux", "has-session", "-t", SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
-def capture_pane() -> str:
+def capture_pane() -> str | None:
   result = subprocess.run(
     ["tmux", "capture-pane", "-t", SESSION, "-p", "-S", "-30"],
     stdout=subprocess.PIPE,
@@ -218,6 +218,8 @@ def capture_pane() -> str:
     text=True,
     check=False,
   )
+  if result.returncode != 0 or not result.stdout.strip():
+    return None
   return result.stdout
 
 
@@ -277,7 +279,11 @@ def main() -> int:
     if not healthy:
       print(f"replay skipped: telegram e2e unhealthy ({reason}); {len(rows)} missed message(s) left pending")
       return 0
-    if not pane_idle(capture_pane()):
+    pane = capture_pane()
+    if pane is None:
+      print(f"replay skipped: pane capture failed; session state unknown; {len(rows)} missed message(s) left pending")
+      return 0
+    if not pane_idle(pane):
       print(f"replay skipped: session busy; {len(rows)} missed message(s) left pending")
       return 0
     inject(prompt)
