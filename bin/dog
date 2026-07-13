@@ -23,6 +23,7 @@ ACCESS_FILE="${STATE_DIR}/access.json"
 TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 HEALTH_FILE="${STATE_DIR}/plugin-health.json"
+WATCHDOG_STATE_FILE="${STATE_DIR}/watchdog.state"
 
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 TMUX_SESSION="${CLAUDE_TELE_SESSION:-telegram-claude}"
@@ -248,6 +249,34 @@ cmd_uninstall() {
     ok "purged ${STATE_DIR}"
   else
     log "config preserved in ${STATE_DIR} (use: dog uninstall --purge to remove it)"
+  fi
+}
+
+watchdog_state_value() {
+  local key="$1" value=""
+  [ -r "$WATCHDOG_STATE_FILE" ] || return 1
+  value=$(grep -E "^${key}=" "$WATCHDOG_STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-) || value=""
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+print_watchdog_context_status() {
+  local pct source last last_display
+  pct=$(watchdog_state_value context_pct 2>/dev/null || true)
+  source=$(watchdog_state_value context_source 2>/dev/null || true)
+  last=$(watchdog_state_value last_compact 2>/dev/null || true)
+
+  if [[ "$pct" =~ ^[0-9]+$ ]] && [[ "$source" =~ ^(meter|transcript)$ ]]; then
+    ok "watchdog context: ${pct}% (source: ${source})"
+  else
+    warn "watchdog context: unavailable (meter absent, transcript unreadable)"
+  fi
+
+  if [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt 0 ]; then
+    last_display=$(date -d "@${last}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf '@%s' "$last")
+    log "watchdog last compact: ${last_display}"
+  else
+    log "watchdog last compact: never recorded"
   fi
 }
 
@@ -511,7 +540,12 @@ case "${1:-help}" in
   preflight) preflight ;;
   tell) shift; cmd_tell "$@" ;;
   uninstall) cmd_uninstall "${@:2}" ;;
-  status|start|stop|restart|doctor|logs)
+  status)
+    engine="$(claude_tele_engine)" || die "the claude-tele engine isn't installed yet; run: dog setup"
+    "$engine" "$@"
+    print_watchdog_context_status
+    ;;
+  start|stop|restart|doctor|logs)
     engine="$(claude_tele_engine)" || die "the claude-tele engine isn't installed yet; run: dog setup"
     "$engine" "$@"
     ;;
