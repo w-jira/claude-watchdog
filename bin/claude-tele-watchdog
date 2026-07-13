@@ -15,7 +15,8 @@
 # handles stale bot.pid cleanup natively.
 #
 # Config via environment (systemd unit or shell for testing):
-#   WATCHDOG_THRESHOLD       Context-% that triggers /compact (default 40)
+#   WATCHDOG_THRESHOLD       Context-% that triggers /compact (default 25)
+#   WATCHDOG_CONTEXT_TOKENS  Context-window capacity for transcript estimate (default 1000000)
 #   WATCHDOG_COOLDOWN        Seconds between compacts (default 900)
 #   WATCHDOG_INTERVAL        Seconds between cycles (default 300)
 #   WATCHDOG_VERIFY_AFTER    Seconds before post-compact verify (default 30)
@@ -42,12 +43,14 @@ readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 readonly HEALTH_FILE="${STATE_DIR}/plugin-health.json"
 readonly WORKDIR="${STATE_DIR}/workdir"
 readonly CLAUDE_AUTH_ALERT_STATE="${STATE_DIR}/watchdog.claude-auth.state"
+readonly NO_CONTEXT_WARN_STATE="${STATE_DIR}/watchdog.no-context.warn"
 readonly LOG_TAG="claude-tele-watchdog"
 readonly ALERT_EMAIL="${WATCHDOG_ALERT_EMAIL:-}"
 readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
 readonly MSMTP_ACCOUNT="${WATCHDOG_MSMTP_ACCOUNT:-default}"
 
-THRESHOLD="${WATCHDOG_THRESHOLD:-40}"
+THRESHOLD="${WATCHDOG_THRESHOLD:-25}"
+CONTEXT_TOKENS="${WATCHDOG_CONTEXT_TOKENS:-1000000}"
 COOLDOWN="${WATCHDOG_COOLDOWN:-900}"
 INTERVAL="${WATCHDOG_INTERVAL:-300}"
 VERIFY_AFTER="${WATCHDOG_VERIFY_AFTER:-30}"
@@ -56,6 +59,7 @@ WARMUP="${WATCHDOG_WARMUP:-10}"
 DEBUG="${WATCHDOG_DEBUG:-0}"
 HEARTBEAT_LOG_EVERY="${WATCHDOG_HEARTBEAT_LOG_EVERY:-0}"
 CLAUDE_AUTH_ALERT_COOLDOWN="${WATCHDOG_CLAUDE_AUTH_ALERT_COOLDOWN:-3600}"
+NO_CONTEXT_WARN_INTERVAL="${WATCHDOG_NO_CONTEXT_WARN_INTERVAL:-600}"
 
 # [H-16] Circuit-breaker: widened from 3-in-1800s (50% duty cycle) to 5-in-7200s.
 # Exponential backoff: 1st trip suppresses 30m, 2nd trip 2h, 3rd+ trips 24h + email.
@@ -142,7 +146,12 @@ bun_alive() {
   return 1
 }
 
-capture_pane() { tmux capture-pane -t "$SESSION" -p -S -15 2>/dev/null || true; }
+capture_pane() {
+  local pane
+  pane=$(tmux capture-pane -t "$SESSION" -p -S -15 2>/dev/null) || return 1
+  [[ "$pane" =~ [^[:space:]] ]] || return 1
+  printf '%s\n' "$pane"
+}
 
 workdir_transcript_glob() {
   local slug
@@ -389,6 +398,169 @@ extract_pct() {
   printf '%s\n' "$1" | grep -aE '[█▌░]' | grep -oE '[0-9]{1,3}%' | tail -1 | tr -d '%' || true
 }
 
+# Newer Claude Code builds may omit the visual context meter. Estimate the
+# current usage from the newest UUID-named transcript for this workdir. A 64KiB
+# tail handles the normal case without rereading a large transcript each tick;
+# only transcripts whose tail has no usable record receive a streaming scan.
+transcript_pct() {
+  python3 - "$WORKDIR" "$CONTEXT_TOKENS" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+workdir, capacity_raw = sys.argv[1:]
+try:
+    capacity = int(capacity_raw)
+    if capacity <= 0:
+        raise ValueError
+except (TypeError, ValueError):
+    raise SystemExit(1)
+
+slug = workdir.replace("/", "-").replace(".", "-")
+project_dir = Path.home() / ".claude" / "projects" / slug
+uuid_name = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.jsonl"
+)
+try:
+    candidates = [
+        path for path in project_dir.iterdir()
+        if path.is_file() and uuid_name.fullmatch(path.name)
+    ]
+    transcript = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+except (OSError, ValueError):
+    raise SystemExit(1)
+
+def used_tokens(line):
+    try:
+        obj = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None
+    message = obj.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+        try:
+            value = int(usage.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            total += value
+    return total if total > 0 else None
+
+try:
+    with transcript.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        start = max(0, size - 64 * 1024)
+        handle.seek(start)
+        tail = handle.read().decode("utf-8", "replace").splitlines()
+except OSError:
+    raise SystemExit(1)
+
+# The first tail line may be a partial JSON object, which simply fails parsing.
+for line in reversed(tail):
+    used = used_tokens(line)
+    if used is not None:
+        print(min(100, (used * 100 + capacity - 1) // capacity))
+        raise SystemExit(0)
+
+if start > 0:
+    last_used = None
+    try:
+        with transcript.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                used = used_tokens(line)
+                if used is not None:
+                    last_used = used
+    except OSError:
+        raise SystemExit(1)
+    if last_used is not None:
+        print(min(100, (last_used * 100 + capacity - 1) // capacity))
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+current_context_signal() {
+  local pane="${1:-}" pct
+  pct=$(extract_pct "$pane")
+  if [[ "$pct" =~ ^[0-9]+$ ]]; then
+    printf '%s meter\n' "$pct"
+    return 0
+  fi
+  pct=$(transcript_pct 2>/dev/null) || return 1
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+  printf '%s transcript\n' "$pct"
+}
+
+# Compatibility helper for callers that only need the numeric value. The main
+# loop uses current_context_signal so it can persist the signal source as well.
+current_context_pct() {
+  local signal pct
+  signal=$(current_context_signal "${1:-}") || return 1
+  read -r pct _ <<< "$signal"
+  printf '%s\n' "$pct"
+}
+
+state_value() {
+  local key="$1" value=""
+  [ -r "$STATE_FILE" ] || return 1
+  value=$(grep -E "^${key}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-) || value=""
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+write_watchdog_state() {
+  local pct="$1" source="$2" last_compact="$3" now tmp
+  now=$(date +%s)
+  tmp="${STATE_FILE}.tmp"
+  {
+    printf 'context_pct=%s\n' "$pct"
+    printf 'context_source=%s\n' "$source"
+    printf 'last_compact=%s\n' "$last_compact"
+    printf 'updated_at=%s\n' "$now"
+  } > "$tmp"
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$STATE_FILE"
+}
+
+record_context_signal() {
+  local pct="$1" source="$2" last=0 legacy=""
+  last=$(state_value last_compact 2>/dev/null || true)
+  if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+    legacy=$(cat "$STATE_FILE" 2>/dev/null || true)
+    [[ "$legacy" =~ ^[0-9]+$ ]] && last="$legacy" || last=0
+  fi
+  write_watchdog_state "$pct" "$source" "$last"
+}
+
+record_compact() {
+  local pct="$1" source="$2"
+  write_watchdog_state "$pct" "$source" "$(date +%s)"
+}
+
+warn_no_context_signal() {
+  local now last=0
+  now=$(date +%s)
+  if [ -r "$NO_CONTEXT_WARN_STATE" ]; then
+    last=$(cat "$NO_CONTEXT_WARN_STATE" 2>/dev/null || true)
+  fi
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if [ $((now - last)) -ge "$NO_CONTEXT_WARN_INTERVAL" ]; then
+    logwarn "no context signal (meter absent, transcript unreadable) — compaction cannot fire"
+    printf '%s\n' "$now" > "${NO_CONTEXT_WARN_STATE}.tmp"
+    chmod 600 "${NO_CONTEXT_WARN_STATE}.tmp" 2>/dev/null || true
+    mv "${NO_CONTEXT_WARN_STATE}.tmp" "$NO_CONTEXT_WARN_STATE"
+  fi
+}
+
 # Detect current prompt/busy state from recent pane content only. Older scrollback can
 # contain stale "Thinking"/token lines long after Claude returned to the prompt.
 pane_idle() {
@@ -417,8 +589,12 @@ cooldown_remaining() {
   local now last=0
   now=$(date +%s)
   if [ -f "$STATE_FILE" ]; then
-    last=$(cat "$STATE_FILE" 2>/dev/null) || last=0
+    last=$(state_value last_compact 2>/dev/null || true)
+    if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+      last=$(cat "$STATE_FILE" 2>/dev/null || true)
+    fi
   fi
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
   echo $((COOLDOWN - (now - last)))
 }
 
@@ -556,11 +732,14 @@ EOF
 
 # ── Compact routine ────────────────────────────────────────────────────────
 send_compact() {
-  local before="$1"
+  local before="$1" source="${2:-unknown}"
   # [M-19] Re-verify idleness immediately before sending. Tiny race window
   # between outer check and this moment, but closes modal-injection risk.
   local pane_now
-  pane_now=$(capture_pane)
+  if ! pane_now=$(capture_pane); then
+    logwarn "compact aborted — pane capture failed; session state unknown"
+    return
+  fi
   if ! pane_idle "$pane_now"; then
     loginfo "compact aborted — session became busy between check and send"
     return
@@ -572,7 +751,7 @@ send_compact() {
 
   loginfo "sending /compact" "ctx_before=${before}%"
   date +%s > "$COMPACT_INFLIGHT"
-  date +%s > "$STATE_FILE"
+  record_compact "$before" "$source"
   tmux send-keys -t "$SESSION" -- "/compact" Enter
 
   # [H-18] EXIT trap in verify subshell so SIGTERM during verification still
@@ -581,13 +760,19 @@ send_compact() {
     trap 'rm -f "$COMPACT_INFLIGHT"' EXIT
     sleep "$VERIFY_AFTER"
     local after
-    after=$(extract_pct "$(capture_pane)")
+    local verify_pane verify_signal verify_source
+    if ! verify_pane=$(capture_pane); then
+      logwarn "verify: pane capture failed; context unknown" "ctx_before=${before}%"
+      return
+    fi
+    verify_signal=$(current_context_signal "$verify_pane" 2>/dev/null || true)
+    read -r after verify_source <<< "$verify_signal"
     if [ -z "$after" ]; then
-      logwarn "verify: no context meter found" "ctx_before=${before}%"
+      logwarn "verify: no context signal found" "ctx_before=${before}%"
     elif [ "$after" -ge "$before" ]; then
       logwarn "verify: context did not drop" "ctx_before=${before}% ctx_after=${after}%"
     else
-      loginfo "verify: context reduced" "ctx_before=${before}% ctx_after=${after}%"
+      loginfo "verify: context reduced" "ctx_before=${before}% ctx_after=${after}% source=${verify_source}"
     fi
   ) &
 }
@@ -721,8 +906,40 @@ PY
   fi
 }
 
+check_context_compaction() {
+  local pane="" pane_known=1 signal="" pct="" source="" remaining
+  if ! pane=$(capture_pane); then
+    pane_known=0
+    logwarn "pane capture failed — session state unknown; compaction will not act"
+  fi
+
+  signal=$(current_context_signal "$pane" 2>/dev/null || true)
+  read -r pct source <<< "$signal"
+  if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ -z "$source" ]; then
+    record_context_signal "unknown" "unavailable"
+    warn_no_context_signal
+    return 0
+  fi
+
+  record_context_signal "$pct" "$source"
+  logdebug "cycle ok" "cycle=${cycle:-0} ctx=${pct}% source=${source}"
+
+  [ "$pct" -ge "$THRESHOLD" ] || return 0
+  remaining=$(cooldown_remaining)
+  if [ "$remaining" -gt 0 ]; then
+    loginfo "context high but cooldown active" "ctx=${pct}% source=${source} cooldown_remaining=${remaining}s"
+  elif [ "$pane_known" != "1" ]; then
+    logwarn "context high but pane state unknown — compaction not sent" "ctx=${pct}% source=${source}"
+  elif ! pane_idle "$pane"; then
+    loginfo "context high but session busy" "ctx=${pct}% source=${source}"
+  else
+    send_compact "$pct" "$source"
+  fi
+}
+
 # ── Main loop ──────────────────────────────────────────────────────────────
-loginfo "started" "threshold=${THRESHOLD}% cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
+watchdog_main() {
+loginfo "started" "threshold=${THRESHOLD}% context_tokens=${CONTEXT_TOKENS} cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
 
 # [Obs-A] Warm-up: skip heal checks for WARMUP seconds so we don't fire during
 # the brief main-service inactive window on restart.
@@ -817,27 +1034,13 @@ while true; do
     fi
   fi
 
-  # 8. Auto-compact when context ≥ threshold AND session is idle.
-  pane=$(capture_pane)
-  pct=$(extract_pct "$pane") || pct=""
-  if [ -z "$pct" ] || ! [[ "$pct" =~ ^[0-9]+$ ]]; then
-    logdebug "no context meter found — skipping compact check" "cycle=${cycle}"
-    nap "$INTERVAL"
-    continue
-  fi
-
-  logdebug "cycle ok" "cycle=${cycle} ctx=${pct}%"
-
-  if [ "$pct" -ge "$THRESHOLD" ]; then
-    remaining=$(cooldown_remaining)
-    if [ "$remaining" -gt 0 ]; then
-      loginfo "context high but cooldown active" "ctx=${pct}% cooldown_remaining=${remaining}s"
-    elif ! pane_idle "$pane"; then
-      loginfo "context high but session busy" "ctx=${pct}%"
-    else
-      send_compact "$pct"
-    fi
-  fi
+  # 8. Auto-compact when context ≥ threshold AND pane idleness is known.
+  check_context_compaction
 
   nap "$INTERVAL"
 done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  watchdog_main
+fi
