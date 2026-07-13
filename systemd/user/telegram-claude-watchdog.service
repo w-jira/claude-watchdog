@@ -53,7 +53,8 @@ MemoryDenyWriteExecute=true
 # heartbeat/cooldown/backoff. No other home access.
 ProtectHome=tmpfs
 BindReadOnlyPaths=%h/bin %h/.local/bin %h/.claude/projects
-BindPaths=%h/.claude/channels/telegram
+BindReadOnlyPaths=%t/bus
+BindPaths=%h/.claude/channels/telegram %t/claude-tele
 
 # Network: AF_INET + AF_INET6 required for the getMe E2E probe to
 # api.telegram.org. AF_UNIX for tmux + D-Bus. AF_NETLINK for /proc reads.

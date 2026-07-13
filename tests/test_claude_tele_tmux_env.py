@@ -15,13 +15,17 @@ def write_executable(path: Path, body: str):
 def test_status_ignores_inherited_tmux_environment(tmp_path):
     fake_bin = tmp_path / "bin"
     home = tmp_path / "home"
+    runtime = tmp_path / "run"
     fake_bin.mkdir()
+    runtime.mkdir()
     (home / ".local" / "bin").mkdir(parents=True)
 
     write_executable(
         fake_bin / "tmux",
         "#!/bin/sh\n"
         "if [ -n \"${TMUX:-}\" ]; then echo inherited TMUX >&2; exit 42; fi\n"
+        "if [ \"${TMUX_TMPDIR:-}\" != \"${EXPECTED_TMUX_TMPDIR:-}\" ]; then echo wrong TMUX_TMPDIR >&2; exit 43; fi\n"
+        "if [ ! -d \"${TMUX_TMPDIR:-/missing}\" ]; then echo missing TMUX_TMPDIR >&2; exit 44; fi\n"
         "case \"$1\" in\n"
         "  has-session) exit 0 ;;\n"
         "  list-panes) echo 12345; exit 0 ;;\n"
@@ -44,6 +48,8 @@ def test_status_ignores_inherited_tmux_environment(tmp_path):
         "HOME": str(home),
         "PATH": f"{fake_bin}:{env['PATH']}",
         "TMUX": "/tmp/not-the-watchdog-socket",
+        "XDG_RUNTIME_DIR": str(runtime),
+        "EXPECTED_TMUX_TMPDIR": str(runtime / "claude-tele"),
     })
     result = subprocess.run(
         [str(CLAUDE_TELE), "status"],

@@ -66,6 +66,10 @@ readonly CLI_LOCK="${STATE_DIR}/claude-tele.lock"
 # Mutex for the systemd ExecStart body — prevents two simultaneous spawns
 # (e.g. from daemon-reload + explicit restart) from racing on tmux cleanup.
 readonly EXEC_LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-tele.exec.lock"
+readonly TMUX_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-tele"
+mkdir -p "$TMUX_RUNTIME_DIR"
+chmod 700 "$TMUX_RUNTIME_DIR"
+export TMUX_TMPDIR="$TMUX_RUNTIME_DIR"
 
 # ── Output helpers ─────────────────────────────────────────────────────────
 # [I-14] Color if stdout OR stderr is a TTY — die/warn write to stderr.
@@ -172,16 +176,8 @@ pane_idle() {
   local recent
   recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -8)
 
-  if printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'; then
-    return 0
-  fi
-  if printf '%s\n' "$recent" | grep -qE '(✻|⏳|↓ [0-9]+ tokens|Cogitat|Thinking|Working|Running tool|Calling |Executing)'; then
-    return 1
-  fi
-  if printf '%s\n' "$recent" | grep -qE '\?|\[y/N\]|Press Enter'; then
-    return 1
-  fi
-  return 0
+  # Idle is a positive authorization: only a visible bottom prompt proves it.
+  printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'
 }
 
 compact_inflight() {

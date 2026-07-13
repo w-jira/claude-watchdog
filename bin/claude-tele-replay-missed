@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any
 
 SESSION = os.environ.get("CLAUDE_TELE_SESSION", "telegram-claude")
+TMUX_RUNTIME_DIR = Path(os.environ.get("TMUX_TMPDIR", Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "claude-tele"))
+TMUX_RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+os.environ["TMUX_TMPDIR"] = str(TMUX_RUNTIME_DIR)
 STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR", Path.home() / ".claude" / "channels" / "telegram"))
 WORKDIR = Path(os.environ.get("CLAUDE_TELE_WORKDIR", STATE_DIR / "workdir"))
 JOURNAL_FILE = Path(os.environ.get("CLAUDE_TELE_INBOUND_JOURNAL", STATE_DIR / "inbound-journal.jsonl"))
