@@ -53,6 +53,8 @@ scan_tracked() {
       [ -n "$line" ] && printf '%s:%s: %s\n' "$file" "$line" "$rule" >> "$scan_output"
     done <<< "$lines"
   done < <(git ls-files -z)
+  # The trailing `read` exits non-zero at EOF; don't let that fail `set -e`.
+  return 0
 }
 
 secret_pattern='TELEGRAM_BOT_TOKEN=[0-9]+:|BEGIN (OPENSSH|RSA|EC|PRIVATE) KEY|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}'
