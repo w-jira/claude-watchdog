@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_URL="${CLAUDE_WATCHDOG_REPO_URL:-https://github.com/w-jira/claude-watchdog.git}"
+DEFAULT_RECOVERY_URL="https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh"
 INSTALL_DIR="${CLAUDE_WATCHDOG_INSTALL_DIR:-${HOME}/.local/share/claude-watchdog/repo}"
 SKIP_SETUP="${CLAUDE_WATCHDOG_SKIP_SETUP:-0}"
 
@@ -31,6 +32,16 @@ fi
 
 cd "$INSTALL_DIR"
 
+recovery_url="$DEFAULT_RECOVERY_URL"
+case "$REPO_URL" in
+  https://github.com/*)
+    recovery_repo="${REPO_URL#https://github.com/}"
+    recovery_repo="${recovery_repo%/}"
+    recovery_repo="${recovery_repo%.git}"
+    recovery_url="https://raw.githubusercontent.com/${recovery_repo}/main/bootstrap.sh"
+    ;;
+esac
+
 if [ "$SKIP_SETUP" = "1" ]; then
   log "skipping setup because CLAUDE_WATCHDOG_SKIP_SETUP=1"
   exit 0
@@ -45,7 +56,7 @@ cat >&2 <<EOF
 [claude-watchdog bootstrap] error: no interactive terminal is available for the setup wizard.
 Run the non-piped installer instead:
 
-  curl -fsSLo /tmp/claude-watchdog-bootstrap.sh ${REPO_URL%/}/raw/main/bootstrap.sh
+  curl -fsSLo /tmp/claude-watchdog-bootstrap.sh ${recovery_url}
   bash /tmp/claude-watchdog-bootstrap.sh
 
 EOF
