@@ -166,6 +166,24 @@ def test_replay_skips_injection_when_claude_pane_is_busy(tmp_path: Path) -> None
   assert not tmux_log.exists() or "paste-buffer" not in tmux_log.read_text(encoding="utf-8")
 
 
+def test_replay_treats_empty_pane_capture_as_unknown(tmp_path: Path) -> None:
+  now = int(time.time())
+  result, tmux_log = run_replay(
+    tmp_path,
+    health={
+      "polling_started_at": now,
+      "last_getme_ok_at": now,
+      "last_mcp_notify_ok_at": now,
+      "last_error": None,
+    },
+    pane="",
+  )
+
+  assert result.returncode == 0
+  assert "pane capture failed; session state unknown" in result.stdout
+  assert not tmux_log.exists() or "paste-buffer" not in tmux_log.read_text(encoding="utf-8")
+
+
 def test_replay_injects_when_telegram_health_is_recently_ok(tmp_path: Path) -> None:
   now = int(time.time())
   result, tmux_log = run_replay(
