@@ -123,7 +123,9 @@ def test_legacy_tmux_detection_warns_for_host_socket_and_skips_unreadable_proc_r
         "#!/bin/sh\n"
         "case \"${2:-}\" in\n"
         "  cat) exit 0 ;;\n"
-        "  show) echo \"$DETECTOR_PID\"; exit 0 ;;\n"
+        # MainPID resolves to a pid with no readable /proc/<pid>/root, so the
+        # detector must SKIP the namespace-socket probe (2 probes, not 3).
+        "  show) echo 2147483646; exit 0 ;;\n"
         "esac\n"
         "exit 1\n",
     )
