@@ -15,6 +15,7 @@ esac
 INSTALL_DEPS=0
 INSTALL_CLAUDE=0
 START_SERVICE=0
+UPDATE_ONLY=0
 YES=0
 CLAUDE_INSTALLED_THIS_RUN=0
 MENU=0
@@ -38,6 +39,7 @@ Options:
   --demo                      Hide sensitive status/log details for demos.
   --menu                      Run the interactive setup wizard (same as ./bin/dog setup).
   --start                     Start the systemd user service after install.
+  --update                    Refresh installed binaries and units; preserve config and do not restart.
   -y, --yes                   Non-interactive yes for supported install steps.
   -h, --help                  Show this help.
 
@@ -58,6 +60,7 @@ while [ "$#" -gt 0 ]; do
     --install-deps) INSTALL_DEPS=1 ;;
     --install-claude) INSTALL_CLAUDE=1 ;;
     --start) START_SERVICE=1 ;;
+    --update) UPDATE_ONLY=1 ;;
     --menu) MENU=1 ;;
     --demo) DEMO_MODE=1 ;;
     -y|--yes) YES=1 ;;
@@ -113,6 +116,7 @@ install_bun() {
   [ "$INSTALL_DEPS" = "1" ] || return 0
   has curl || die "curl is required to install bun"
   has unzip || die "unzip is required to install bun"
+  has sha256sum || die "sha256sum is required to verify the Bun download — refusing to install unverified"
 
   local arch asset tmp zipdir
   case "$(uname -m)" in
@@ -141,16 +145,12 @@ install_bun() {
   # Supply-chain: verify the download against the release's published SHA256SUMS
   # before unzipping/executing it. HTTPS alone doesn't protect against a swapped
   # or tampered release asset.
-  if has sha256sum; then
-    curl -fL --proto '=https' --tlsv1.2 \
-      "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/SHASUMS256.txt" \
-      -o "${tmp}/SHASUMS256.txt"
-    ( cd "$tmp" && grep -E "  ${asset}\$" SHASUMS256.txt | sha256sum -c - ) \
-      || die "bun checksum verification failed for ${asset} — refusing to install"
-    log "verified ${asset} against published SHA256SUMS"
-  else
-    warn "sha256sum not found — cannot verify bun download integrity; proceeding"
-  fi
+  curl -fL --proto '=https' --tlsv1.2 \
+    "https://github.com/oven-sh/bun/releases/download/${BUN_VERSION}/SHASUMS256.txt" \
+    -o "${tmp}/SHASUMS256.txt"
+  ( cd "$tmp" && grep -E "  ${asset}\$" SHASUMS256.txt | sha256sum -c - ) \
+    || die "bun checksum verification failed for ${asset} — refusing to install"
+  log "verified ${asset} against published SHA256SUMS"
   unzip -q "${tmp}/${asset}" -d "$tmp"
   zipdir="${tmp}/bun-linux-${arch}"
   install -d -m 700 "${HOME}/.bun/bin" "${HOME}/bin"
@@ -390,8 +390,8 @@ if [ "$INSTALL_CLAUDE" = "1" ]; then
   install_claude_code
 fi
 
-mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}" "${HOME}/.npm-global"
-chmod 700 "${STATE_DIR}" "${WORKDIR}"
+mkdir -p "${HOME}/bin" "${STATE_DIR}" "${WORKDIR}" "${SYSTEMD_DIR}" "${HOME}/.npm-global" "${HOME}/.claude/projects"
+chmod 700 "${STATE_DIR}" "${WORKDIR}" "${HOME}/.claude/projects"
 
 if [ "$NPM_PACKAGE_INSTALL" = "1" ]; then
   install_npm_dog_shim
@@ -413,6 +413,13 @@ remove_legacy_cwd
 install -m 600 "${ROOT}/systemd/user/telegram-claude.service" "${SYSTEMD_DIR}/telegram-claude.service"
 install -m 600 "${ROOT}/systemd/user/telegram-claude-watchdog.service" "${SYSTEMD_DIR}/telegram-claude-watchdog.service"
 expose_npm_package_to_systemd
+
+if [ "$UPDATE_ONLY" = "1" ]; then
+  systemctl --user daemon-reload
+  log "updated installed binaries and systemd units; configuration was preserved"
+  log "next: dog restart"
+  exit 0
+fi
 
 ensure_claude_symlink
 install_plugin
