@@ -1,9 +1,9 @@
 [Unit]
 Description=Telegram-Claude context watchdog (auto-compact + self-heal)
 After=telegram-claude.service
-# [H-33 + M-34] BindsTo= force-stops the watchdog when main goes inactive and
-# auto-pulls it back up when main comes active. Requires= is redundant and
-# removed (BindsTo implies it).
+# [H-33 + M-34] BindsTo= force-stops the watchdog when main goes inactive; the
+# main unit's Wants= (re)starts it when main starts/restarts. Requires= is not
+# used because a watchdog failure must not bring down main.
 BindsTo=telegram-claude.service
 # [L-36] Widened from 30s: RestartSec=10 × StartLimitBurst=5 = 50s needs ≥ 60s.
 StartLimitBurst=5

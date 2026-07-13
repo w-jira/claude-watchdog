@@ -251,6 +251,38 @@ remove_legacy_cwd() {
   fi
 }
 
+detect_legacy_tmux_socket() {
+  local uid name runtime_dir new_socket host_socket main_pid namespace_socket
+  local -a legacy_sockets=()
+  uid="$(id -u)"
+  name="${CLAUDE_TELE_SESSION:-telegram-claude}"
+  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${uid}}/claude-tele"
+  new_socket="${runtime_dir}/tmux-${uid}/default"
+
+  if env -u TMUX tmux -S "$new_socket" has-session -t "$name" 2>/dev/null; then
+    return 0
+  fi
+
+  systemctl --user cat telegram-claude.service >/dev/null 2>&1 || return 0
+
+  host_socket="/tmp/tmux-${uid}/default"
+  if env -u TMUX tmux -S "$host_socket" has-session -t "$name" 2>/dev/null; then
+    legacy_sockets+=("$host_socket")
+  fi
+
+  main_pid="$(systemctl --user show -p MainPID --value telegram-claude.service 2>/dev/null || true)"
+  if [[ "$main_pid" =~ ^[0-9]+$ ]] && [ "$main_pid" -gt 0 ] && [ -r "/proc/${main_pid}/root" ]; then
+    namespace_socket="/proc/${main_pid}/root/tmp/tmux-${uid}/default"
+    if env -u TMUX tmux -S "$namespace_socket" has-session -t "$name" 2>/dev/null; then
+      legacy_sockets+=("$namespace_socket")
+    fi
+  fi
+
+  [ "${#legacy_sockets[@]}" -gt 0 ] || return 0
+  warn "LEGACY-SOCKET SESSION DETECTED at ${legacy_sockets[*]} — the running version predates the shared-runtime socket."
+  warn "Complete the exact supervised cutover in docs/operations.md, 'Migrating a legacy-socket session', before restarting; keep a second shell/console available."
+}
+
 write_env() {
   validate_permission_mode
   if [ -n "$BOT_TOKEN" ]; then
@@ -380,6 +412,8 @@ PY
 }
 
 [ "$MENU" = "1" ] && exec "${ROOT}/bin/dog" setup
+
+detect_legacy_tmux_socket
 
 if [ "$INSTALL_DEPS" = "1" ]; then
   install_apt_deps

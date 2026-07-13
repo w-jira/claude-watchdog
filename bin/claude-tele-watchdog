@@ -436,7 +436,7 @@ try:
         ),
         key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
-    )[:3]
+    )[:2]
 except OSError:
     raise SystemExit(1)
 
@@ -468,7 +468,7 @@ def used_tokens(line):
     return total if total > 0 else None
 
 
-# Bound every cycle to the newest 4 MiB of at most three candidate sessions.
+# Bound every cycle to the newest + one fallback session, ≤8 MiB/cycle.
 # This handles transcript rotation without repeatedly rescanning huge histories.
 max_scan_bytes = 4 * 1024 * 1024
 for transcript in candidates:
@@ -567,11 +567,12 @@ warn_no_context_signal() {
 pane_idle() {
   local pane="$1"
   local recent
-  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -8)
+  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d')
+  [ -n "$recent" ] || return 1
 
   # Idle is a positive authorization: only a visible bottom prompt proves it.
   # Unknown renderers, streaming states, and future status text fail closed.
-  printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'
+  printf '%s\n' "$recent" | tail -1 | grep -qE '^❯[[:space:]]*$'
 }
 
 cooldown_remaining() {

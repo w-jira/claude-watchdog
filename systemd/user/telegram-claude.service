@@ -2,6 +2,7 @@
 Description=Claude Code Telegram Channel (always-on)
 After=network-online.target
 Wants=network-online.target
+Wants=telegram-claude-watchdog.service
 # [M-27] Widened from 120s: RestartSec=30 × StartLimitBurst=5 = 150s needs ≥ 150s window.
 StartLimitBurst=5
 StartLimitIntervalSec=600
