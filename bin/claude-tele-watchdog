@@ -42,6 +42,10 @@ readonly TOKEN_KEY_FILE="${STATE_DIR}/.token.key"
 readonly TOKEN_ENC_FILE="${STATE_DIR}/.token.enc"
 readonly HEALTH_FILE="${STATE_DIR}/plugin-health.json"
 readonly WORKDIR="${STATE_DIR}/workdir"
+readonly TMUX_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-tele"
+mkdir -p "$TMUX_RUNTIME_DIR"
+chmod 700 "$TMUX_RUNTIME_DIR"
+export TMUX_TMPDIR="$TMUX_RUNTIME_DIR"
 readonly CLAUDE_AUTH_ALERT_STATE="${STATE_DIR}/watchdog.claude-auth.state"
 readonly NO_CONTEXT_WARN_STATE="${STATE_DIR}/watchdog.no-context.warn"
 readonly LOG_TAG="claude-tele-watchdog"
@@ -425,13 +429,17 @@ uuid_name = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.jsonl"
 )
 try:
-    candidates = [
-        path for path in project_dir.iterdir()
-        if path.is_file() and uuid_name.fullmatch(path.name)
-    ]
-    transcript = max(candidates, key=lambda path: path.stat().st_mtime_ns)
-except (OSError, ValueError):
+    candidates = sorted(
+        (
+            path for path in project_dir.iterdir()
+            if path.is_file() and uuid_name.fullmatch(path.name)
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )[:2]
+except OSError:
     raise SystemExit(1)
+
 
 def used_tokens(line):
     try:
@@ -445,7 +453,12 @@ def used_tokens(line):
     if not isinstance(usage, dict):
         return None
     total = 0
-    for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+    for key in (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ):
         try:
             value = int(usage.get(key) or 0)
         except (TypeError, ValueError):
@@ -454,35 +467,23 @@ def used_tokens(line):
             total += value
     return total if total > 0 else None
 
-try:
-    with transcript.open("rb") as handle:
-        size = handle.seek(0, os.SEEK_END)
-        start = max(0, size - 64 * 1024)
-        handle.seek(start)
-        tail = handle.read().decode("utf-8", "replace").splitlines()
-except OSError:
-    raise SystemExit(1)
 
-# The first tail line may be a partial JSON object, which simply fails parsing.
-for line in reversed(tail):
-    used = used_tokens(line)
-    if used is not None:
-        print(min(100, (used * 100 + capacity - 1) // capacity))
-        raise SystemExit(0)
-
-if start > 0:
-    last_used = None
+# Bound every cycle to the newest + one fallback session, ≤8 MiB/cycle.
+# This handles transcript rotation without repeatedly rescanning huge histories.
+max_scan_bytes = 4 * 1024 * 1024
+for transcript in candidates:
     try:
-        with transcript.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                used = used_tokens(line)
-                if used is not None:
-                    last_used = used
+        with transcript.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - max_scan_bytes))
+            tail = handle.read().decode("utf-8", "replace").splitlines()
     except OSError:
-        raise SystemExit(1)
-    if last_used is not None:
-        print(min(100, (last_used * 100 + capacity - 1) // capacity))
-        raise SystemExit(0)
+        continue
+    for line in reversed(tail):
+        used = used_tokens(line)
+        if used is not None:
+            print(min(100, (used * 100 + capacity - 1) // capacity))
+            raise SystemExit(0)
 
 raise SystemExit(1)
 PY
@@ -566,23 +567,12 @@ warn_no_context_signal() {
 pane_idle() {
   local pane="$1"
   local recent
-  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -8)
+  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d')
+  [ -n "$recent" ] || return 1
 
-  # Prompt visible at the bottom means idle, even if older scrollback has busy markers.
-  if printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'; then
-    return 0
-  fi
-
-  # In-flight markers from Claude Code's UI. Check only recent lines to avoid
-  # stale scrollback suppressing compaction forever.
-  if printf '%s\n' "$recent" | grep -qE '(✻|⏳|↓ [0-9]+ tokens|Cogitat|Thinking|Working|Running tool|Calling |Executing)'; then
-    return 1
-  fi
-  # Question/modal prompts.
-  if printf '%s\n' "$recent" | grep -qE '\?|\[y/N\]|Press Enter'; then
-    return 1
-  fi
-  return 0
+  # Idle is a positive authorization: only a visible bottom prompt proves it.
+  # Unknown renderers, streaming states, and future status text fail closed.
+  printf '%s\n' "$recent" | tail -1 | grep -qE '^❯[[:space:]]*$'
 }
 
 cooldown_remaining() {

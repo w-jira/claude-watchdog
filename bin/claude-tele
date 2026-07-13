@@ -66,6 +66,10 @@ readonly CLI_LOCK="${STATE_DIR}/claude-tele.lock"
 # Mutex for the systemd ExecStart body — prevents two simultaneous spawns
 # (e.g. from daemon-reload + explicit restart) from racing on tmux cleanup.
 readonly EXEC_LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-tele.exec.lock"
+readonly TMUX_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-tele"
+mkdir -p "$TMUX_RUNTIME_DIR"
+chmod 700 "$TMUX_RUNTIME_DIR"
+export TMUX_TMPDIR="$TMUX_RUNTIME_DIR"
 
 # ── Output helpers ─────────────────────────────────────────────────────────
 # [I-14] Color if stdout OR stderr is a TTY — die/warn write to stderr.
@@ -170,18 +174,12 @@ extract_pct() {
 pane_idle() {
   local pane="$1"
   local recent
-  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -8)
+  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d')
+  [ -n "$recent" ] || return 1
 
-  if printf '%s\n' "$recent" | tail -3 | grep -qE '^❯[[:space:]]*$'; then
-    return 0
-  fi
-  if printf '%s\n' "$recent" | grep -qE '(✻|⏳|↓ [0-9]+ tokens|Cogitat|Thinking|Working|Running tool|Calling |Executing)'; then
-    return 1
-  fi
-  if printf '%s\n' "$recent" | grep -qE '\?|\[y/N\]|Press Enter'; then
-    return 1
-  fi
-  return 0
+  # Idle is a positive authorization: only a visible bottom prompt proves it.
+  # Unknown renderers, streaming states, and future status text fail closed.
+  printf '%s\n' "$recent" | tail -1 | grep -qE '^❯[[:space:]]*$'
 }
 
 compact_inflight() {
@@ -573,10 +571,10 @@ cmd_start() {
     die "service failed to activate — run: claude-tele logs"
   fi
   ok "service started"
-  # Watchdog auto-pulls via BindsTo= — no manual start needed.
+  # The main unit's Wants= pulls the watchdog up; retain an explicit fallback.
   sleep 1
   if wd_active; then
-    ok "watchdog auto-started (BindsTo)"
+    ok "watchdog auto-started (main Wants=)"
   else
     info "watchdog not yet active — starting explicitly"
     systemctl --user enable --now "$WATCHDOG_SERVICE" \
@@ -590,19 +588,24 @@ cmd_stop() {
   info "stopping ${SERVICE}…"
   systemctl --user stop "$SERVICE"
   ok "stopped"
-  # Watchdog auto-stops via BindsTo=.
+  # BindsTo= force-stops the watchdog when main goes inactive.
 }
 
-# [H-33 + Obs-A] Remove the manual watchdog dance. BindsTo= handles it, and
-# `systemctl restart` is atomic (stop→start with proper ordering). A 10-second
-# warm-up at the top of the watchdog's main loop suppresses spurious heals
-# during the brief inactive window.
+# [H-33 + Obs-A] BindsTo= handles the stop half and the main unit's Wants=
+# pulls the watchdog up on start. `systemctl restart` remains atomic, while the
+# explicit pull-up below provides insurance if the dependency start failed.
 cmd_restart() {
   info "restarting ${SERVICE} (conversation resumes via --continue)…"
   systemctl --user restart "$SERVICE"
   sleep 3
   svc_active || die "restart failed — run: claude-tele logs"
   ok "restarted"
+  if ! wd_active; then
+    info "watchdog not yet active — starting explicitly"
+    systemctl --user enable --now "$WATCHDOG_SERVICE" \
+      && ok "watchdog started" \
+      || warn "watchdog failed — telegram works; auto-compact won't"
+  fi
 }
 
 cmd_status() {
@@ -685,8 +688,8 @@ cmd_logs() {
   journalctl "${args[@]}"
 }
 
-# [M-10 + H-33] Heal is now just: ensure the service is running, restart if
-# bun is missing. No manual watchdog manipulation — BindsTo= handles it.
+# [M-10 + H-33] Heal ensures the main service is running, relying on its Wants=
+# to pull up the watchdog, and restarts main if bun is missing.
 cmd_heal() {
   if svc_active && ! bun_alive; then
     warn "service active but bun bridge missing — restarting"
@@ -698,7 +701,7 @@ cmd_heal() {
     cmd_start
     return
   fi
-  # Watchdog should be alive via BindsTo; pull it up if not.
+  # Watchdog should be alive via the main unit's Wants=; pull it up if not.
   if ! wd_active; then
     info "watchdog not running — starting"
     systemctl --user enable --now "$WATCHDOG_SERVICE" && ok "watchdog started"

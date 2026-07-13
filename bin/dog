@@ -27,6 +27,8 @@ WATCHDOG_STATE_FILE="${STATE_DIR}/watchdog.state"
 
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 TMUX_SESSION="${CLAUDE_TELE_SESSION:-telegram-claude}"
+TMUX_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/claude-tele"
+export TMUX_TMPDIR="$TMUX_RUNTIME_DIR"
 
 # --plain (also NO_COLOR, or a non-TTY stdout) disables color + ASCII art so
 # output stays clean over SSH, in CI, and in logs.

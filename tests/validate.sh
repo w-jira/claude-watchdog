@@ -32,6 +32,7 @@ for source, target in (
     text = text.replace("ExecStart=%h/bin/claude-tele __exec-start", "ExecStart=/bin/true")
     text = text.replace("ExecStop=%h/bin/claude-tele __exec-stop", "ExecStop=/bin/true")
     text = text.replace("ExecStart=%h/bin/claude-tele-watchdog", "ExecStart=/bin/true")
+    text = text.replace("Wants=telegram-claude-watchdog.service", "Wants=cwd-validate-telegram-claude-watchdog.service")
     text = text.replace("BindsTo=telegram-claude.service", "BindsTo=cwd-validate-telegram-claude.service")
     (out / target).write_text(text, encoding="utf-8")
 PY

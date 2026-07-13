@@ -2,6 +2,7 @@
 Description=Claude Code Telegram Channel (always-on)
 After=network-online.target
 Wants=network-online.target
+Wants=telegram-claude-watchdog.service
 # [M-27] Widened from 120s: RestartSec=30 × StartLimitBurst=5 = 150s needs ≥ 150s window.
 StartLimitBurst=5
 StartLimitIntervalSec=600
@@ -11,6 +12,8 @@ StartLimitIntervalSec=600
 # tracks liveness correctly. (Previous Type=forking + RemainAfterExit=yes
 # pinned the unit as "active" even after claude died, defeating Restart=.)
 Type=simple
+RuntimeDirectory=claude-tele
+RuntimeDirectoryMode=0700
 ExecStart=%h/bin/claude-tele __exec-start
 ExecStop=%h/bin/claude-tele __exec-stop
 Restart=always

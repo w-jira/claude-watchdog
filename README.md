@@ -113,7 +113,7 @@ claude-tele attach
 
 ## Platform support
 
-- Linux: full support. Uses `systemd --user`, `tmux`, watchdog auto-heal, context compaction, and missed-message replay. Transcript-based context compaction is fixed in this PR and requires the watchdog unit's read-only `~/.claude/projects` bind mount.
+- Linux: full support. Uses `systemd --user`, `tmux`, watchdog auto-heal, context compaction, and missed-message replay. Transcript-based context compaction requires the watchdog unit's read-only `~/.claude/projects` bind mount.
 
 ## Requirements
 
@@ -125,7 +125,7 @@ Before the bot can run, you need:
 
 Linux full mode also needs `systemd --user`, plus `tmux`, `python3`, `git`, `openssl`, `curl`, and `unzip`. On Debian/Ubuntu, `dog setup` can install these system dependencies (and a pinned, checksum-verified Bun) when you approve it — but never Node.js or Claude Code.
 
-On hardened systemd installs, context compaction also requires `BindReadOnlyPaths=%h/.claude/projects` in `telegram-claude-watchdog.service`. The repository unit and `install.sh --update` include this mount so the watchdog can read transcript usage when Claude Code does not render its context meter.
+On hardened systemd installs, context compaction requires three narrow runtime mounts: read-only transcript access at `BindReadOnlyPaths=%h/.claude/projects`, read-only user-bus access at `BindReadOnlyPaths=%t/bus`, and the dedicated tmux runtime at `BindPaths=%t/claude-tele`. The main service alone owns `%t/claude-tele`; the watchdog only mounts it, so restarting the watchdog cannot remove Claude's socket. The repository units and `install.sh --update` preserve this setup.
 
 ## Permissions
 
