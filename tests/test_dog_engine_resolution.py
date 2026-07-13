@@ -43,3 +43,29 @@ def test_dog_status_prefers_installed_home_engine_over_stale_path(tmp_path):
 
     assert "home-engine status" in result.stdout
     assert "stale-engine" not in result.stdout
+
+
+def test_dog_status_reports_watchdog_context_state(tmp_path):
+    home = tmp_path / "home"
+    home_bin = home / "bin"
+    state = home / ".claude" / "channels" / "telegram"
+    state.mkdir(parents=True)
+    write_executable(home_bin / "claude-tele", "#!/bin/sh\necho engine-status\n")
+    (state / "watchdog.state").write_text(
+        "context_pct=42\ncontext_source=transcript\nlast_compact=1000000000\nupdated_at=1000000001\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update({"HOME": str(home), "PATH": f"{home_bin}:{env['PATH']}"})
+
+    result = subprocess.run(
+        [str(DOG), "status"],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    assert "watchdog context: 42% (source: transcript)" in result.stdout
+    assert "watchdog last compact:" in result.stdout
