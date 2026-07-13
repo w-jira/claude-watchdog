@@ -79,3 +79,5 @@ def test_bootstrap_handles_piped_mode_safely():
     assert "[ -r /dev/tty ] && [ -w /dev/tty ]" in text
     assert "no interactive terminal is available" in text
     assert "bash /tmp/claude-watchdog-bootstrap.sh" in text
+    assert "https://raw.githubusercontent.com/w-jira/claude-watchdog/main/bootstrap.sh" in text
+    assert "${REPO_URL%/}/raw/main/bootstrap.sh" not in text
