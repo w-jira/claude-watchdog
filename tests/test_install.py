@@ -68,10 +68,11 @@ def test_bun_install_refuses_missing_sha256sum() -> None:
     assert "cannot verify bun download integrity; proceeding" not in text
 
 
-def test_watchdog_unit_has_canonical_threshold_and_transcript_mount() -> None:
+def test_watchdog_unit_has_canonical_compaction_thresholds_and_transcript_mount() -> None:
     text = WATCHDOG_UNIT.read_text(encoding="utf-8")
 
     assert "Environment=WATCHDOG_THRESHOLD=30" in text
+    assert "Environment=WATCHDOG_HARD_CEILING=45" in text
     assert "BindReadOnlyPaths=%h/bin %h/.local/bin %h/.claude/projects" in text
 
 
