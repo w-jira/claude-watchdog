@@ -2,9 +2,13 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CLAUDE_TELE = ROOT / "bin" / "claude-tele"
+WATCHDOG = ROOT / "bin" / "claude-tele-watchdog"
+FIXTURES = ROOT / "tests" / "fixtures"
 
 
 def write_executable(path: Path, body: str):
@@ -19,10 +23,16 @@ def shell_function(path: Path, name: str) -> str:
     return text[start:end]
 
 
-def run_pane_idle(pane: str) -> subprocess.CompletedProcess[str]:
-    body = shell_function(CLAUDE_TELE, "pane_idle")
+def run_pane_idle(path: Path, pane: str, locale: str) -> subprocess.CompletedProcess[str]:
+    body = "\n".join(
+        shell_function(path, name)
+        for name in ("pane_normalize", "pane_has_bare_prompt", "pane_idle")
+    )
+    env = os.environ.copy()
+    env.update({"LANG": locale, "LC_ALL": locale})
     return subprocess.run(
         ["bash", "-c", f'{body}\npane_idle "$1"', "bash", pane],
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -82,17 +92,29 @@ def test_status_ignores_inherited_tmux_environment(tmp_path):
     assert "inherited TMUX" not in result.stderr
 
 
-def test_pane_idle_requires_prompt_as_final_nonblank_line_and_fails_closed():
-    idle = run_pane_idle("status\n❯\n\n")
-    status_below = run_pane_idle("status\n❯\nWorking…\n")
-    empty = run_pane_idle("  \n\t\n")
+@pytest.mark.parametrize("path", [CLAUDE_TELE, WATCHDOG], ids=["claude-tele", "watchdog"])
+@pytest.mark.parametrize("locale", ["en_US.UTF-8", "C"])
+def test_pane_idle_normalizes_real_prompt_and_fails_closed(path: Path, locale: str):
+    busy = (FIXTURES / "pane_busy_real.txt").read_text(encoding="utf-8")
+    idle = (FIXTURES / "pane_idle_real.txt").read_text(encoding="utf-8")
+    cases = [
+        (busy, False),
+        (idle, True),
+        ("❯\n", True),
+        ("permission required\n❯ 1. Yes\n", False),
+        ("❯ some text\n", False),
+        ("", False),
+    ]
 
-    assert idle.returncode == 0, idle.stderr
-    assert status_below.returncode != 0
-    assert empty.returncode != 0
+    for pane, expected_idle in cases:
+        result = run_pane_idle(path, pane, locale)
+        assert (result.returncode == 0) is expected_idle, (
+            f"{path.name} under {locale} returned {result.returncode} for {pane!r}: "
+            f"{result.stderr}"
+        )
 
 
-def test_startup_wait_keeps_broader_prompt_scan():
+def test_startup_wait_uses_nbsp_aware_prompt_scan():
     text = CLAUDE_TELE.read_text(encoding="utf-8")
 
-    assert "printf '%s\\n' \"$pane\" | tail -6 | grep -qE '^❯[[:space:]]*$'" in text
+    assert 'if pane_has_bare_prompt "$pane"; then' in text

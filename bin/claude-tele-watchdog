@@ -16,6 +16,7 @@
 #
 # Config via environment (systemd unit or shell for testing):
 #   WATCHDOG_THRESHOLD       Context-% that triggers /compact (default 25)
+#   WATCHDOG_HARD_CEILING    Busy-session escalation percentage (default 45; must exceed threshold)
 #   WATCHDOG_CONTEXT_TOKENS  Context-window capacity for transcript estimate (default 1000000)
 #   WATCHDOG_COOLDOWN        Seconds between compacts (default 900)
 #   WATCHDOG_INTERVAL        Seconds between cycles (default 300)
@@ -54,6 +55,8 @@ readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
 readonly MSMTP_ACCOUNT="${WATCHDOG_MSMTP_ACCOUNT:-default}"
 
 THRESHOLD="${WATCHDOG_THRESHOLD:-25}"
+HARD_CEILING="${WATCHDOG_HARD_CEILING:-45}"
+HARD_CEILING_ENABLED=1
 CONTEXT_TOKENS="${WATCHDOG_CONTEXT_TOKENS:-1000000}"
 COOLDOWN="${WATCHDOG_COOLDOWN:-900}"
 INTERVAL="${WATCHDOG_INTERVAL:-300}"
@@ -101,6 +104,30 @@ logdebug() {
   fi
   return 0
 }
+
+valid_percent() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 100 ]
+}
+
+validate_compaction_config() {
+  if ! valid_percent "$THRESHOLD"; then
+    logwarn "invalid WATCHDOG_THRESHOLD — using default 25 (expected integer 1-100)"
+    THRESHOLD=25
+  fi
+
+  if ! valid_percent "$HARD_CEILING"; then
+    logwarn "invalid WATCHDOG_HARD_CEILING — using default 45 (expected integer 1-100)"
+    HARD_CEILING=45
+  fi
+
+  if [ "$HARD_CEILING" -le "$THRESHOLD" ]; then
+    logwarn "WATCHDOG_HARD_CEILING must be greater than WATCHDOG_THRESHOLD — hard-ceiling escalation disabled" \
+      "threshold=${THRESHOLD}% ceiling=${HARD_CEILING}%"
+    HARD_CEILING_ENABLED=0
+  fi
+}
+
+validate_compaction_config
 
 current_sleep_pid=""
 shutdown() {
@@ -562,17 +589,37 @@ warn_no_context_signal() {
   fi
 }
 
-# Detect current prompt/busy state from recent pane content only. Older scrollback can
-# contain stale "Thinking"/token lines long after Claude returned to the prompt.
+# Normalize the prompt's UTF-8 NBSP explicitly so matching works in both the
+# service's UTF-8 locale and LC_ALL=C test/recovery shells.
+pane_normalize() {
+  printf '%s\n' "$1" | sed $'s/\302\240/ /g'
+}
+
+pane_has_bare_prompt() {
+  pane_normalize "$1" | grep -qE '^❯[[:space:]]*$'
+}
+
+# Reject the TUI's running-turn footer first, then require a visible empty input
+# prompt. Unknown renderers, permission dialogs, typed drafts, and empty captures
+# fail closed.
 pane_idle() {
   local pane="$1"
   local recent
-  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d')
+  recent=$(pane_normalize "$pane" | sed '/^[[:space:]]*$/d')
   [ -n "$recent" ] || return 1
 
-  # Idle is a positive authorization: only a visible bottom prompt proves it.
-  # Unknown renderers, streaming states, and future status text fail closed.
-  printf '%s\n' "$recent" | tail -1 | grep -qE '^❯[[:space:]]*$'
+  # Busy wins even though Claude keeps the empty input box visible while it runs.
+  printf '%s\n' "$recent" | grep -qF 'esc to interrupt' && return 1
+
+  pane_has_bare_prompt "$recent"
+}
+
+hard_ceiling_breached() {
+  local pct="$1" pane="$2"
+  [ "$HARD_CEILING_ENABLED" = "1" ] || return 1
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+  [ "$pct" -ge "$HARD_CEILING" ] || return 1
+  pane_has_bare_prompt "$pane"
 }
 
 cooldown_remaining() {
@@ -722,23 +769,52 @@ EOF
 
 # ── Compact routine ────────────────────────────────────────────────────────
 send_compact() {
-  local before="$1" source="${2:-unknown}"
+  local before="$1" source="${2:-unknown}" mode="${3:-idle}" remaining
+  remaining=$(cooldown_remaining)
+  if [ "$remaining" -gt 0 ]; then
+    loginfo "compact aborted — cooldown became active before send" "cooldown_remaining=${remaining}s"
+    return
+  fi
+  if compact_inflight; then
+    loginfo "compact aborted — another compact is already in flight"
+    return
+  fi
+
   # [M-19] Re-verify idleness immediately before sending. Tiny race window
-  # between outer check and this moment, but closes modal-injection risk.
+  # between outer check and this moment, but closes modal-injection risk. At
+  # the hard ceiling, re-verify the empty input box instead of requiring idle.
   local pane_now
   if ! pane_now=$(capture_pane); then
     logwarn "compact aborted — pane capture failed; session state unknown"
     return
   fi
-  if ! pane_idle "$pane_now"; then
-    loginfo "compact aborted — session became busy between check and send"
-    return
-  fi
+  case "$mode" in
+    idle)
+      if ! pane_idle "$pane_now"; then
+        loginfo "compact aborted — session became busy between check and send"
+        return
+      fi
+      ;;
+    hard-ceiling)
+      if ! pane_has_bare_prompt "$pane_now"; then
+        loginfo "compact aborted — input prompt disappeared before hard-ceiling send"
+        return
+      fi
+      ;;
+    *)
+      logwarn "compact aborted — unknown send mode"
+      return
+      ;;
+  esac
   if ! telegram_e2e_healthy; then
     logwarn "compact aborted — Telegram E2E health is not fresh"
     return
   fi
 
+  if [ "$mode" = "hard-ceiling" ]; then
+    logwarn "hard ceiling breached — compacting despite busy session" \
+      "ctx=${before}% ceiling=${HARD_CEILING}% source=${source}"
+  fi
   loginfo "sending /compact" "ctx_before=${before}%"
   date +%s > "$COMPACT_INFLIGHT"
   record_compact "$before" "$source"
@@ -918,10 +994,16 @@ check_context_compaction() {
   remaining=$(cooldown_remaining)
   if [ "$remaining" -gt 0 ]; then
     loginfo "context high but cooldown active" "ctx=${pct}% source=${source} cooldown_remaining=${remaining}s"
+  elif compact_inflight; then
+    loginfo "context high but compact already in flight" "ctx=${pct}% source=${source}"
   elif [ "$pane_known" != "1" ]; then
     logwarn "context high but pane state unknown — compaction not sent" "ctx=${pct}% source=${source}"
   elif ! pane_idle "$pane"; then
-    loginfo "context high but session busy" "ctx=${pct}% source=${source}"
+    if hard_ceiling_breached "$pct" "$pane"; then
+      send_compact "$pct" "$source" hard-ceiling
+    else
+      loginfo "context high but session busy" "ctx=${pct}% source=${source}"
+    fi
   else
     send_compact "$pct" "$source"
   fi
@@ -929,7 +1011,11 @@ check_context_compaction() {
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 watchdog_main() {
-loginfo "started" "threshold=${THRESHOLD}% context_tokens=${CONTEXT_TOKENS} cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
+  local hard_ceiling_status="disabled"
+  if [ "$HARD_CEILING_ENABLED" = "1" ]; then
+    hard_ceiling_status="${HARD_CEILING}%"
+  fi
+  loginfo "started" "threshold=${THRESHOLD}% hard_ceiling=${hard_ceiling_status} context_tokens=${CONTEXT_TOKENS} cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
 
 # [Obs-A] Warm-up: skip heal checks for WARMUP seconds so we don't fire during
 # the brief main-service inactive window on restart.

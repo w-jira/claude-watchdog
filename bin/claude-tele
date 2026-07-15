@@ -168,18 +168,29 @@ extract_pct() {
   printf '%s\n' "$1" | grep -aE '[█▌░]' | grep -oE '[0-9]{1,3}%' | tail -1 | tr -d '%' || true
 }
 
-# Keep this conservative: only inject /compact when the pane looks idle. This
-# mirrors the watchdog guard so an MCP-triggered compact cannot type into a
-# prompt, modal, or in-flight tool call.
+# Normalize the prompt's UTF-8 NBSP explicitly so matching works in both the
+# service's UTF-8 locale and LC_ALL=C test/recovery shells.
+pane_normalize() {
+  printf '%s\n' "$1" | sed $'s/\302\240/ /g'
+}
+
+pane_has_bare_prompt() {
+  pane_normalize "$1" | grep -qE '^❯[[:space:]]*$'
+}
+
+# Keep this conservative: reject the TUI's running-turn footer first, then
+# require a visible empty input prompt. Unknown renderers, permission dialogs,
+# typed drafts, and empty captures fail closed.
 pane_idle() {
   local pane="$1"
   local recent
-  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d')
+  recent=$(pane_normalize "$pane" | sed '/^[[:space:]]*$/d')
   [ -n "$recent" ] || return 1
 
-  # Idle is a positive authorization: only a visible bottom prompt proves it.
-  # Unknown renderers, streaming states, and future status text fail closed.
-  printf '%s\n' "$recent" | tail -1 | grep -qE '^❯[[:space:]]*$'
+  # Busy wins even though Claude keeps the empty input box visible while it runs.
+  printf '%s\n' "$recent" | grep -qF 'esc to interrupt' && return 1
+
+  pane_has_bare_prompt "$recent"
 }
 
 compact_inflight() {
@@ -480,7 +491,7 @@ PY
       continue
     fi
     # Break once the input prompt "❯" appears (all prompts cleared).
-    if printf '%s\n' "$pane" | tail -6 | grep -qE '^❯[[:space:]]*$'; then
+    if pane_has_bare_prompt "$pane"; then
       break
     fi
     sleep 1
