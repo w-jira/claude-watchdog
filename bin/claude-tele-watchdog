@@ -102,6 +102,7 @@ logdebug() {
   return 0
 }
 
+
 current_sleep_pid=""
 shutdown() {
   loginfo "shutdown"
@@ -562,18 +563,31 @@ warn_no_context_signal() {
   fi
 }
 
-# Detect current prompt/busy state from recent pane content only. Older scrollback can
-# contain stale "Thinking"/token lines long after Claude returned to the prompt.
+# Normalize the prompt's UTF-8 NBSP explicitly so matching works in both the
+# service's UTF-8 locale and LC_ALL=C test/recovery shells.
+pane_normalize() {
+  printf '%s\n' "$1" | sed $'s/\302\240/ /g'
+}
+
+pane_has_bare_prompt() {
+  pane_normalize "$1" | grep -qE '^❯[[:space:]]*$'
+}
+
+# Reject the TUI's running-turn footer first, then require a visible empty input
+# prompt. Unknown renderers, permission dialogs, typed drafts, and empty captures
+# fail closed.
 pane_idle() {
   local pane="$1"
   local recent
-  recent=$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d')
+  recent=$(pane_normalize "$pane" | sed '/^[[:space:]]*$/d')
   [ -n "$recent" ] || return 1
 
-  # Idle is a positive authorization: only a visible bottom prompt proves it.
-  # Unknown renderers, streaming states, and future status text fail closed.
-  printf '%s\n' "$recent" | tail -1 | grep -qE '^❯[[:space:]]*$'
+  # Busy wins even though Claude keeps the empty input box visible while it runs.
+  printf '%s\n' "$recent" | grep -qF 'esc to interrupt' && return 1
+
+  pane_has_bare_prompt "$recent"
 }
+
 
 cooldown_remaining() {
   local now last=0
