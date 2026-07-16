@@ -72,7 +72,8 @@ def test_watchdog_unit_has_canonical_compaction_thresholds_and_transcript_mount(
     text = WATCHDOG_UNIT.read_text(encoding="utf-8")
 
     assert "Environment=WATCHDOG_THRESHOLD=30" in text
-    assert "Environment=WATCHDOG_HARD_CEILING=45" in text
+    assert "Environment=WATCHDOG_HARD_CEILING=40" in text
+    assert "Environment=WATCHDOG_ELEVATED_GRACE=900" in text
     assert "BindReadOnlyPaths=%h/bin %h/.local/bin %h/.claude/projects" in text
 
 

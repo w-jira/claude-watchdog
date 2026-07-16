@@ -22,7 +22,7 @@ def watchdog_env(tmp_path: Path, **overrides: str) -> tuple[dict[str, str], Path
     state = home / ".claude" / "channels" / "telegram"
     fake_bin = tmp_path / "bin"
     runtime = tmp_path / "run"
-    state.mkdir(parents=True)
+    state.mkdir(parents=True, exist_ok=True)
     fake_bin.mkdir(parents=True)
     runtime.mkdir()
     write_executable(fake_bin / "logger", "#!/bin/sh\nexit 0\n")
@@ -85,6 +85,7 @@ def run_compaction_case(
     *,
     threshold: str = "25",
     hard_ceiling: str = "45",
+    **env_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     tmux_log = tmp_path / "tmux.log"
     pane_file = tmp_path / "pane.txt"
@@ -98,6 +99,7 @@ def run_compaction_case(
         CLAUDE_TELE_DISABLE_E2E_INJECTION_GATE="1",
         TMUX_LOG=str(tmux_log),
         PANE_FILE=str(pane_file),
+        **env_overrides,
     )
     write_executable(
         fake_bin / "tmux",
@@ -232,13 +234,20 @@ def test_both_sources_empty_warns_and_is_rate_limited(tmp_path: Path) -> None:
     assert "context_source=unavailable" in state.read_text(encoding="utf-8")
 
 
-def test_pane_idle_allows_footer_below_prompt_but_busy_marker_wins(tmp_path: Path) -> None:
+def test_pane_idle_keys_on_turn_timer_not_footer(tmp_path: Path) -> None:
     env, _, _ = watchdog_env(tmp_path)
     idle = run_function(env, "pane_idle $'status\\n❯\\302\\240\\nshortcuts footer\\n'")
-    busy = run_function(env, "pane_idle $'status\\n❯\\302\\240\\nesc to interrupt\\n'")
+    # The standing footer (background tasks) must NOT read as busy: main prompt idle.
+    idle_bg = run_function(
+        env,
+        "pane_idle $'❯\\302\\240\\n⏵⏵ auto mode on · 1 shell · esc to interrupt · ← for agents\\n'",
+    )
+    # A live main turn shows the elapsed-timer parenthetical — that IS busy.
+    busy = run_function(env, "pane_idle $'✻ Working… (33s · ↓ 1.1k tokens)\\n❯\\302\\240\\n'")
     empty = run_function(env, "pane_idle $'  \\n\\t\\n'")
 
     assert idle.returncode == 0, idle.stderr
+    assert idle_bg.returncode == 0, idle_bg.stderr
     assert busy.returncode != 0
     assert empty.returncode != 0
 
@@ -325,7 +334,7 @@ def test_ambiguous_nonempty_pane_without_prompt_never_authorizes_compaction(tmp_
 def test_busy_session_below_hard_ceiling_does_not_send(tmp_path: Path) -> None:
     result, tmux_log = run_compaction_case(
         tmp_path,
-        "workdir █████░░░ 40%\n❯\u00a0\nesc to interrupt\n",
+        "workdir █████░░░ 40%\n✻ Working… (33s · ↓ 1.1k tokens)\n❯\u00a0\n",
     )
 
     assert result.returncode == 0, result.stderr
@@ -336,7 +345,7 @@ def test_busy_session_below_hard_ceiling_does_not_send(tmp_path: Path) -> None:
 def test_hard_ceiling_sends_when_busy_input_box_is_visible(tmp_path: Path) -> None:
     result, tmux_log = run_compaction_case(
         tmp_path,
-        "workdir █████░░░ 46%\n❯\u00a0\nesc to interrupt\n",
+        "workdir █████░░░ 46%\n✻ Working… (33s · ↓ 1.1k tokens)\n❯\u00a0\n",
     )
 
     assert result.returncode == 0, result.stderr
@@ -356,10 +365,42 @@ def test_hard_ceiling_does_not_send_into_modal_without_bare_prompt(tmp_path: Pat
     assert "send-keys" not in tmux_log
 
 
+def test_elevated_grace_forces_compact_during_long_busy_stretch(tmp_path: Path) -> None:
+    # Context has sat >= threshold (below ceiling) while busy for longer than the
+    # grace window -> force at the visible input prompt.
+    state = tmp_path / "home" / ".claude" / "channels" / "telegram"
+    state.mkdir(parents=True)
+    (state / "watchdog.elevated-since").write_text("1000000000\n", encoding="utf-8")
+    result, tmux_log = run_compaction_case(
+        tmp_path,
+        "workdir █████░░░ 40%\n✻ Working… (33s · ↓ 1.1k tokens)\n❯\u00a0\n",
+        WATCHDOG_ELEVATED_GRACE="60",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "context elevated past grace — compacting despite busy session" in result.stdout
+    assert "send-keys -t telegram-claude -- /compact Enter" in tmux_log
+
+
+def test_elevated_grace_zero_disables_the_force(tmp_path: Path) -> None:
+    state = tmp_path / "home" / ".claude" / "channels" / "telegram"
+    state.mkdir(parents=True)
+    (state / "watchdog.elevated-since").write_text("1000000000\n", encoding="utf-8")
+    result, tmux_log = run_compaction_case(
+        tmp_path,
+        "workdir █████░░░ 40%\n✻ Working… (33s · ↓ 1.1k tokens)\n❯\u00a0\n",
+        WATCHDOG_ELEVATED_GRACE="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "context high but session busy" in result.stdout
+    assert "send-keys" not in tmux_log
+
+
 def test_hard_ceiling_not_above_threshold_is_disabled_with_warning(tmp_path: Path) -> None:
     result, tmux_log = run_compaction_case(
         tmp_path,
-        "workdir █████░░░ 46%\n❯\u00a0\nesc to interrupt\n",
+        "workdir █████░░░ 46%\n✻ Working… (33s · ↓ 1.1k tokens)\n❯\u00a0\n",
         threshold="45",
         hard_ceiling="45",
     )
