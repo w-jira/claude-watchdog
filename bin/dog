@@ -291,6 +291,8 @@ Commands:
                Flag: --config-only  (write config, skip service install/start)
   preflight    Check this machine is ready to set up (Claude Code, deps, systemd).
   tell         Send a note to the live Claude session. Example: dog tell "status?"
+  update       Update the tool to the latest version (git pull or npm), then refresh
+               installed binaries + units. Preserves config; run 'dog restart' to apply.
   uninstall    Remove the service + binaries. Flag: --purge (also delete config + token).
   help         Show this menu.
 
@@ -445,6 +447,36 @@ choose_permission() {
   esac
 }
 
+# `dog update` — one-liner to pull the latest tool + refresh installed binaries/units.
+# Detects install method (git checkout vs npm global) and does the right thing.
+# Preserves config, does not restart (so an in-flight session isn't interrupted);
+# tells the user to `dog restart` to run the new code.
+cmd_update() {
+  banner
+  case "$ROOT" in
+    */node_modules/@wjira/claude-watchdog|*/node_modules/.pnpm/*claude-watchdog*)
+      command -v npm >/dev/null 2>&1 || die "npm not found — update manually: npm install -g @wjira/claude-watchdog@latest"
+      log "Updating via npm (global package)…"
+      npm install -g @wjira/claude-watchdog@latest || die "npm update failed"
+      ;;
+    *)
+      [ -d "${ROOT}/.git" ] || die "not a git checkout or npm install (ROOT=${ROOT}) — update manually"
+      command -v git >/dev/null 2>&1 || die "git not found"
+      if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+        die "working tree at ${ROOT} has uncommitted changes — commit or stash them, then re-run"
+      fi
+      log "Updating via git (checkout at ${ROOT})…"
+      git -C "$ROOT" fetch --quiet --prune || die "git fetch failed"
+      git -C "$ROOT" pull --ff-only || die "git pull failed (branch diverged? resolve manually)"
+      ;;
+  esac
+  local installer="${ROOT}/install.sh"
+  [ -x "$installer" ] || die "install.sh not found at ${installer}"
+  log "Refreshing installed binaries + units (config preserved, no restart)…"
+  "$installer" --update || die "install.sh --update failed"
+  ok "updated. Run 'dog restart' to run the new version (also applies on next restart)."
+}
+
 # Ensure Claude Code's remote-control-at-startup is enabled, so the Telegram
 # session accepts local steering (dog tell / channel control) without a manual
 # settings edit. Idempotent; merges into the user's settings.json (honoring
@@ -577,6 +609,7 @@ EOF
 
 case "${1:-help}" in
   setup) cmd_setup "${@:2}" ;;
+  update) cmd_update ;;
   preflight) preflight ;;
   tell) shift; cmd_tell "$@" ;;
   uninstall) cmd_uninstall "${@:2}" ;;
