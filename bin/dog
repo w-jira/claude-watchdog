@@ -445,6 +445,42 @@ choose_permission() {
   esac
 }
 
+# Ensure Claude Code's remote-control-at-startup is enabled, so the Telegram
+# session accepts local steering (dog tell / channel control) without a manual
+# settings edit. Idempotent; merges into the user's settings.json (honoring
+# CLAUDE_CONFIG_DIR) without clobbering other keys; backs up before writing.
+ensure_remote_control() {
+  local dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+  local file="${dir}/settings.json"
+  if ! command -v node >/dev/null 2>&1; then
+    warn "node not found — enable \"remoteControlAtStartup\": true in ${file} manually"
+    return 0
+  fi
+  mkdir -p "$dir"
+  local out
+  out="$(node - "$file" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+let cfg = {};
+if (fs.existsSync(file)) {
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); }
+  catch { console.log('EPARSE'); process.exit(0); }
+}
+if (cfg.remoteControlAtStartup === true) { console.log('ALREADY'); process.exit(0); }
+if (fs.existsSync(file)) fs.copyFileSync(file, file + '.bak');
+cfg.remoteControlAtStartup = true;
+fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+console.log('SET');
+NODE
+)" || { warn "could not update ${file} — enable \"remoteControlAtStartup\": true manually"; return 0; }
+  case "$out" in
+    ALREADY) ok "remote control already enabled at startup" ;;
+    SET)     ok "enabled remote control at startup (${file}; prior settings backed up to .bak)" ;;
+    EPARSE)  warn "could not parse ${file} — left untouched; enable \"remoteControlAtStartup\": true manually" ;;
+    *)       warn "unexpected result updating ${file}; verify \"remoteControlAtStartup\": true manually" ;;
+  esac
+}
+
 cmd_setup() {
   local installer=""
   if [ -f "${ROOT}/config/env.example" ] && [ -f "${ROOT}/config/access.example.json" ]; then
@@ -521,6 +557,8 @@ EOF
   write_access "$user_id"
   unset token
   ok "wrote secure config files (${STATE_DIR}; token not printed)"
+
+  ensure_remote_control
 
   if [ "$config_only" = "1" ]; then
     ok "config-only: skipped service install/start"

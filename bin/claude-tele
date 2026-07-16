@@ -839,7 +839,7 @@ cmd_doctor() {
   local_check "access.json present"                             fatal  test -f "${STATE_DIR}/access.json"
   local_check "access.json permissions 600"                     fatal  bash -c "[ \$(stat -c '%a' '${STATE_DIR}/access.json' 2>/dev/null) = '600' ]"
   local_check "telegram plugin installed"                       fatal  bash -c "compgen -G '${HOME}/.claude/plugins/cache/*/telegram' >/dev/null"
-  local_check "remote control enabled at startup"               soft   bash -c "grep -Eq '\"remoteControlAtStartup\"[[:space:]]*:[[:space:]]*true' '${HOME}/.claude/settings.json' 2>/dev/null"
+  local_check "remote control enabled at startup"               soft   bash -c "grep -Eq '\"remoteControlAtStartup\"[[:space:]]*:[[:space:]]*true' \"\${CLAUDE_CONFIG_DIR:-\${HOME}/.claude}/settings.json\" 2>/dev/null"
   local_check "service enabled on boot"                         soft   systemctl --user is-enabled --quiet "$SERVICE"
   local_check "watchdog enabled on boot"                        soft   systemctl --user is-enabled --quiet "$WATCHDOG_SERVICE"
   local_check "lingering enabled (survives logout)"                  fatal  bash -c "loginctl show-user \$(id -un) 2>/dev/null | grep -q 'Linger=yes'"
