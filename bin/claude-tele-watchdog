@@ -625,6 +625,25 @@ pane_is_streaming() {
     | grep -qE '\(([0-9]+h )?([0-9]+m )?[0-9]+s( ·|\))'
 }
 
+# Diagnostic shape of the pane, appended to busy-verdict logs so a stuck-busy
+# stretch names the failing predicate (2026-07-16: idle session sat busy for
+# 5.5h at 45% with no visible bare prompt; cause unidentifiable from booleans
+# we didn't log). Counts only — never raw pane text, which can carry secrets.
+#   bare_prompt   lines that are exactly "❯"        (idle/force requirement)
+#   draft_prompt  "❯ <text>" lines                  (draft occupying the input box)
+#   prompt_glyphs any line containing ❯             (is the input box rendered at all?)
+#   timer_lines   non-footer elapsed-timer matches  (pane_is_streaming trigger)
+pane_debug_summary() {
+  local norm
+  norm=$(pane_normalize "$1")
+  printf 'nonempty=%s prompt_glyphs=%s bare_prompt=%s draft_prompt=%s timer_lines=%s' \
+    "$(printf '%s\n' "$norm" | sed '/^[[:space:]]*$/d' | grep -c .)" \
+    "$(printf '%s\n' "$norm" | grep -c '❯')" \
+    "$(printf '%s\n' "$norm" | grep -cE '^❯[[:space:]]*$')" \
+    "$(printf '%s\n' "$norm" | grep -cE '^❯[[:space:]]*[^[:space:]]')" \
+    "$(printf '%s\n' "$norm" | grep -vE '⏵|auto mode on|← for agents|↓ to manage' | grep -cE '\(([0-9]+h )?([0-9]+m )?[0-9]+s( ·|\))')"
+}
+
 # Idle = no live main-turn signal AND a visible empty input prompt. Unknown
 # renderers, permission dialogs, typed drafts, and empty captures fail closed.
 # Background tasks/shells do NOT make the session busy — injecting at the main
@@ -1056,7 +1075,7 @@ check_context_compaction() {
         "ctx=${pct}% threshold=${THRESHOLD}% grace=${ELEVATED_GRACE}s source=${source}"
       send_compact "$pct" "$source" hard-ceiling
     else
-      loginfo "context high but session busy" "ctx=${pct}% source=${source}"
+      loginfo "context high but session busy" "ctx=${pct}% source=${source} $(pane_debug_summary "$pane")"
     fi
   else
     send_compact "$pct" "$source"
