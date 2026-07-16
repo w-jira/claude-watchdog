@@ -26,7 +26,7 @@ def shell_function(path: Path, name: str) -> str:
 def run_pane_idle(path: Path, pane: str, locale: str) -> subprocess.CompletedProcess[str]:
     body = "\n".join(
         shell_function(path, name)
-        for name in ("pane_normalize", "pane_has_bare_prompt", "pane_idle")
+        for name in ("pane_normalize", "pane_has_bare_prompt", "pane_is_streaming", "pane_idle")
     )
     env = os.environ.copy()
     env.update({"LANG": locale, "LC_ALL": locale})
@@ -97,9 +97,15 @@ def test_status_ignores_inherited_tmux_environment(tmp_path):
 def test_pane_idle_normalizes_real_prompt_and_fails_closed(path: Path, locale: str):
     busy = (FIXTURES / "pane_busy_real.txt").read_text(encoding="utf-8")
     idle = (FIXTURES / "pane_idle_real.txt").read_text(encoding="utf-8")
+    busy_bg = (FIXTURES / "pane_busy_streaming_with_bg.txt").read_text(encoding="utf-8")
+    idle_bg = (FIXTURES / "pane_idle_with_background.txt").read_text(encoding="utf-8")
     cases = [
         (busy, False),
         (idle, True),
+        # Background tasks keep "esc to interrupt" in the footer — main prompt is
+        # still idle. The 30h false-busy regression.
+        (busy_bg, False),
+        (idle_bg, True),
         ("❯\n", True),
         ("permission required\n❯ 1. Yes\n", False),
         ("❯ some text\n", False),

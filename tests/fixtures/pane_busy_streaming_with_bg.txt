@@ -1,0 +1,24 @@
+● Opus #3 independently reproduced it live — sampling the pane 3× and confirming
+  the footer bar (with "esc to interrupt") persists even when the turn spinner
+  is gone, plus a crucial detail: the current TUI's spinner parenthetical is (8m
+  58s · ↓ 31.8k tokens) with no interrupt hint, so busy-detection must anchor
+  on the duration/timer pattern, not any "esc" string. It also ruled out
+  send_compact suppressors and scrollback staleness. While opus #2 (policy)
+  finishes, I'm starting the corrected implementation — capturing real fixtures
+  from the live pane first.
+
+● Running 1 shell command…
+  ⎿  $ export TMUX_TMPDIR=/run/user/1000/claude-tele; cd
+     ~/projects/claude-watchdog && git checkout -q main && git pull -q && git
+     checkout -q -b fix/pane-idle-footer-false-busy
+     # capture the real CURRENT pane (streaming turn + background footer) as the
+     busy fixture
+     tmux -L default capture-pane -t telegr…
+
+✢ Choreographing… (44s · ↓ 36.4k tokens)
+  ⎿  Tip: Send messages to Claude while it works to steer Claude in real-time
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · esc to interrupt · ← for agents · ↓ to manage /rc

@@ -16,7 +16,9 @@
 #
 # Config via environment (systemd unit or shell for testing):
 #   WATCHDOG_THRESHOLD       Context-% that triggers /compact (default 25)
-#   WATCHDOG_HARD_CEILING    Busy-session escalation percentage (default 45; must exceed threshold)
+#   WATCHDOG_HARD_CEILING    Busy-session escalation percentage (default 40; must exceed threshold)
+#   WATCHDOG_ELEVATED_GRACE  Seconds context may sit >= threshold during a busy session before
+#                            force-compacting at the next visible input prompt (default 900; 0 disables)
 #   WATCHDOG_CONTEXT_TOKENS  Context-window capacity for transcript estimate (default 1000000)
 #   WATCHDOG_COOLDOWN        Seconds between compacts (default 900)
 #   WATCHDOG_INTERVAL        Seconds between cycles (default 300)
@@ -49,14 +51,16 @@ chmod 700 "$TMUX_RUNTIME_DIR"
 export TMUX_TMPDIR="$TMUX_RUNTIME_DIR"
 readonly CLAUDE_AUTH_ALERT_STATE="${STATE_DIR}/watchdog.claude-auth.state"
 readonly NO_CONTEXT_WARN_STATE="${STATE_DIR}/watchdog.no-context.warn"
+readonly ELEVATED_SINCE_FILE="${STATE_DIR}/watchdog.elevated-since"
 readonly LOG_TAG="claude-tele-watchdog"
 readonly ALERT_EMAIL="${WATCHDOG_ALERT_EMAIL:-}"
 readonly ALERT_FROM="${WATCHDOG_ALERT_FROM:-claude-tele-watchdog@localhost}"
 readonly MSMTP_ACCOUNT="${WATCHDOG_MSMTP_ACCOUNT:-default}"
 
 THRESHOLD="${WATCHDOG_THRESHOLD:-25}"
-HARD_CEILING="${WATCHDOG_HARD_CEILING:-45}"
+HARD_CEILING="${WATCHDOG_HARD_CEILING:-40}"
 HARD_CEILING_ENABLED=1
+ELEVATED_GRACE="${WATCHDOG_ELEVATED_GRACE:-900}"
 CONTEXT_TOKENS="${WATCHDOG_CONTEXT_TOKENS:-1000000}"
 COOLDOWN="${WATCHDOG_COOLDOWN:-900}"
 INTERVAL="${WATCHDOG_INTERVAL:-300}"
@@ -116,8 +120,13 @@ validate_compaction_config() {
   fi
 
   if ! valid_percent "$HARD_CEILING"; then
-    logwarn "invalid WATCHDOG_HARD_CEILING — using default 45 (expected integer 1-100)"
-    HARD_CEILING=45
+    logwarn "invalid WATCHDOG_HARD_CEILING — using default 40 (expected integer 1-100)"
+    HARD_CEILING=40
+  fi
+
+  if ! [[ "$ELEVATED_GRACE" =~ ^[0-9]+$ ]]; then
+    logwarn "invalid WATCHDOG_ELEVATED_GRACE — using default 900 (expected integer seconds; 0 disables)"
+    ELEVATED_GRACE=900
   fi
 
   if [ "$HARD_CEILING" -le "$THRESHOLD" ]; then
@@ -571,6 +580,7 @@ record_context_signal() {
 
 record_compact() {
   local pct="$1" source="$2"
+  elevated_clear
   write_watchdog_state "$pct" "$source" "$(date +%s)"
 }
 
@@ -599,17 +609,33 @@ pane_has_bare_prompt() {
   pane_normalize "$1" | grep -qE '^❯[[:space:]]*$'
 }
 
-# Reject the TUI's running-turn footer first, then require a visible empty input
-# prompt. Unknown renderers, permission dialogs, typed drafts, and empty captures
-# fail closed.
+# A live MAIN turn shows a status/spinner line with an elapsed-timer parenthetical
+# ("✻ Considering… (1m 7s · ↓ 2.2k tokens)"). That — not the standing footer bar —
+# is the real busy signal. The footer ("⏵⏵ auto mode on · 1 shell · esc to
+# interrupt · ← for agents") stays on screen whenever ANY background task runs,
+# even with the main loop idle at the prompt, so footer text must be ignored:
+# keying busy off "esc to interrupt" pinned the verdict to busy for 30h straight
+# (3606/3606 cycles) while background agents ran. Search everything EXCEPT
+# footer-marker lines for the turn TIMER parenthetical only — glyph/ellipsis
+# heuristics are unreliable (background status lines like "◉ Running 2 shell
+# commands…" match them while the main loop is idle).
+pane_is_streaming() {
+  pane_normalize "$1" \
+    | grep -vE '⏵|auto mode on|← for agents|↓ to manage' \
+    | grep -qE '\(([0-9]+h )?([0-9]+m )?[0-9]+s( ·|\))'
+}
+
+# Idle = no live main-turn signal AND a visible empty input prompt. Unknown
+# renderers, permission dialogs, typed drafts, and empty captures fail closed.
+# Background tasks/shells do NOT make the session busy — injecting at the main
+# prompt queues safely at the turn boundary.
 pane_idle() {
   local pane="$1"
   local recent
   recent=$(pane_normalize "$pane" | sed '/^[[:space:]]*$/d')
   [ -n "$recent" ] || return 1
 
-  # Busy wins even though Claude keeps the empty input box visible while it runs.
-  printf '%s\n' "$recent" | grep -qF 'esc to interrupt' && return 1
+  pane_is_streaming "$recent" && return 1
 
   pane_has_bare_prompt "$recent"
 }
@@ -619,6 +645,30 @@ hard_ceiling_breached() {
   [ "$HARD_CEILING_ENABLED" = "1" ] || return 1
   [[ "$pct" =~ ^[0-9]+$ ]] || return 1
   [ "$pct" -ge "$HARD_CEILING" ] || return 1
+  pane_has_bare_prompt "$pane"
+}
+
+# Track how long context has sat >= THRESHOLD without a compact. During a
+# marathon-busy session the idle path never fires and the hard ceiling may not
+# be reached, so after ELEVATED_GRACE seconds we force at the next visible
+# input prompt (mild mid-turn interference, bounded by COOLDOWN).
+elevated_mark() {
+  [ -f "$ELEVATED_SINCE_FILE" ] && return 0
+  date +%s > "${ELEVATED_SINCE_FILE}.tmp" && mv "${ELEVATED_SINCE_FILE}.tmp" "$ELEVATED_SINCE_FILE"
+}
+
+elevated_clear() {
+  rm -f "$ELEVATED_SINCE_FILE"
+}
+
+elevated_force_due() {
+  local pane="$1" since now
+  [ "$ELEVATED_GRACE" -gt 0 ] || return 1
+  [ -f "$ELEVATED_SINCE_FILE" ] || return 1
+  since=$(cat "$ELEVATED_SINCE_FILE" 2>/dev/null || true)
+  [[ "$since" =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s)
+  [ $((now - since)) -ge "$ELEVATED_GRACE" ] || return 1
   pane_has_bare_prompt "$pane"
 }
 
@@ -990,7 +1040,7 @@ check_context_compaction() {
   record_context_signal "$pct" "$source"
   logdebug "cycle ok" "cycle=${cycle:-0} ctx=${pct}% source=${source}"
 
-  [ "$pct" -ge "$THRESHOLD" ] || return 0
+  if [ "$pct" -ge "$THRESHOLD" ]; then elevated_mark; else elevated_clear; return 0; fi
   remaining=$(cooldown_remaining)
   if [ "$remaining" -gt 0 ]; then
     loginfo "context high but cooldown active" "ctx=${pct}% source=${source} cooldown_remaining=${remaining}s"
@@ -1000,6 +1050,10 @@ check_context_compaction() {
     logwarn "context high but pane state unknown — compaction not sent" "ctx=${pct}% source=${source}"
   elif ! pane_idle "$pane"; then
     if hard_ceiling_breached "$pct" "$pane"; then
+      send_compact "$pct" "$source" hard-ceiling
+    elif elevated_force_due "$pane"; then
+      logwarn "context elevated past grace — compacting despite busy session" \
+        "ctx=${pct}% threshold=${THRESHOLD}% grace=${ELEVATED_GRACE}s source=${source}"
       send_compact "$pct" "$source" hard-ceiling
     else
       loginfo "context high but session busy" "ctx=${pct}% source=${source}"
@@ -1015,7 +1069,7 @@ watchdog_main() {
   if [ "$HARD_CEILING_ENABLED" = "1" ]; then
     hard_ceiling_status="${HARD_CEILING}%"
   fi
-  loginfo "started" "threshold=${THRESHOLD}% hard_ceiling=${hard_ceiling_status} context_tokens=${CONTEXT_TOKENS} cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
+  loginfo "started" "threshold=${THRESHOLD}% hard_ceiling=${hard_ceiling_status} elevated_grace=${ELEVATED_GRACE}s context_tokens=${CONTEXT_TOKENS} cooldown=${COOLDOWN}s interval=${INTERVAL}s warmup=${WARMUP}s getme_every=${GETME_EVERY} debug=${DEBUG} heartbeat_log_every=${HEARTBEAT_LOG_EVERY}"
 
 # [Obs-A] Warm-up: skip heal checks for WARMUP seconds so we don't fire during
 # the brief main-service inactive window on restart.
